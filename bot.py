@@ -1,4 +1,6 @@
 import os
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -7,6 +9,22 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
 )
+
+# --- Render Port-Check Server ---
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"MailPay Bot is Live!")
+
+    def log_message(self, format, *args):
+        return  # Silence standard HTTP logs in Render output
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
+# --------------------------------
 
 # Load variables from the .env file
 load_dotenv()
@@ -352,6 +370,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 if __name__ == "__main__":
+    # Start background web server to pass Render port scan
+    threading.Thread(target=run_health_server, daemon=True).start()
+
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
