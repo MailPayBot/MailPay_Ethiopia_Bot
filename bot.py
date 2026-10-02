@@ -18,8 +18,8 @@ from telegram.ext import (
 WAITING_PAYMENT_METHOD, WAITING_PAYMENT_DETAILS = range(2)
 
 # --- Admin Telegram Chat ID ---
-# Replace this with your actual Telegram User ID so the bot sends notifications directly to you!
-ADMIN_CHAT_ID =   982922116
+# Replace 123456789 with your actual Telegram numeric User ID!
+ADMIN_CHAT_ID = 123456789
 
 # --- Render Port-Check Server ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -405,30 +405,93 @@ async def receive_payment_details(update: Update, context: ContextTypes.DEFAULT_
 
     slot_email = assigned_slot["email"] if assigned_slot else "Unknown Email"
 
-    # Send notification to Admin
+    # Send notification to Admin with Approve / Reject buttons
     if ADMIN_CHAT_ID:
         try:
             admin_msg = (
-                f"🚨 *NEW ACCOUNT CREATED!*\n\n"
+                f"🚨 *NEW ACCOUNT SUBMISSION*\n\n"
                 f"👤 **User:** @{user.username or 'No Username'} (ID: `{user.id}`)\n"
                 f"📧 **Assigned Email:** `{slot_email}`\n"
                 f"💳 **Payment Method:** {method}\n"
                 f"🔢 **Payment Details:** `{user_details}`"
             )
-            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=admin_msg, parse_mode="Markdown")
+            admin_keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Approve", callback_data=f"adm_approve_{user.id}"),
+                    InlineKeyboardButton("❌ Reject", callback_data=f"adm_reject_{user.id}"),
+                ]
+            ])
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=admin_msg,
+                parse_mode="Markdown",
+                reply_markup=admin_keyboard,
+            )
         except Exception as e:
             print(f"Failed to send notification to admin: {e}")
 
     # Confirmation message to user
     await update.message.reply_text(
-        "🎉 *You have successfully created the account!*\n\n"
-        "Once it is verified, you will get paid **10 ETB** per account.\n\n"
+        "🎉 *You have successfully submitted the account details!*\n\n"
+        "Your submission is under review. Once verified, you will get paid **10 ETB** per account.\n\n"
         "Thank you for participating with MailPay 🇪🇹",
         parse_mode="Markdown",
         reply_markup=main_menu(),
     )
 
     return ConversationHandler.END
+
+
+# --- ADMIN APPROVE / REJECT HANDLER ---
+async def admin_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    parts = data.split("_")
+    action = parts[1]  # 'approve' or 'reject'
+    target_user_id = int(parts[2])
+
+    if action == "approve":
+        # Update admin message
+        await query.edit_message_text(
+            f"{query.message.text}\n\n✅ *STATUS: APPROVED & PAID*",
+            parse_mode="Markdown",
+        )
+        # Send message to user
+        try:
+            await context.bot.send_message(
+                chat_id=target_user_id,
+                text=(
+                    "🎉 *GREAT NEWS!*\n\n"
+                    "Your Gmail account creation submission has been **APPROVED**! "
+                    "Your payment of **10 ETB** has been processed.\n\n"
+                    "Thank you for working with MailPay 🇪🇹!"
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            print(f"Failed to notify user {target_user_id}: {e}")
+
+    elif action == "reject":
+        # Update admin message
+        await query.edit_message_text(
+            f"{query.message.text}\n\n❌ *STATUS: REJECTED*",
+            parse_mode="Markdown",
+        )
+        # Send message to user
+        try:
+            await context.bot.send_message(
+                chat_id=target_user_id,
+                text=(
+                    "❌ *SUBMISSION UPDATE*\n\n"
+                    "Your Gmail account creation submission was **NOT VERIFIED** or did not meet the requirements.\n\n"
+                    "If you believe this is an error, please contact support: " + SUPPORT_USERNAME
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            print(f"Failed to notify user {target_user_id}: {e}")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -452,6 +515,7 @@ if __name__ == "__main__":
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CallbackQueryHandler(admin_decision, pattern="^adm_"))
     app.add_handler(CallbackQueryHandler(buttons))
 
     print("MailPay Ethiopia bot is running...")
