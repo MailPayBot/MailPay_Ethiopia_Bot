@@ -1,90 +1,89 @@
 import os
-import logging
-from datetime import datetime, timedelta
-from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from datetime import datetime, timedelta
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from dotenv import load_dotenv
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
-    CommandHandler,
-    MessageHandler,
     CallbackQueryHandler,
+    CommandHandler,
     ContextTypes,
-    ConversationHandler,
-    filters,
 )
 
-# Enable logging
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
-
-# --- KEEP-ALIVE HTTP SERVER FOR RENDER WEB SERVICE ---
+# --- Render Port-Check Server ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
-        self.send_header("Content-type", "text/html")
         self.end_headers()
-        self.wfile.write(b"MailPay ET Bot is running successfully!")
+        self.wfile.write(b"MailPay Bot is Live!")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
 
     def log_message(self, format, *args):
-        return
+        return  # Silence standard HTTP logs in Render output
 
 def run_health_server():
-    port = int(os.getenv("PORT", "8080"))
+    port = int(os.environ.get("PORT", 8080))
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    logging.info(f"Health check web server running on port {port}")
     server.serve_forever()
+# --------------------------------
 
-# --- ENVIRONMENT VARIABLES ---
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-raw_admin_id = os.getenv("ADMIN_CHAT_ID", "982922116").strip().replace('"', '').replace("'", "")
-ADMIN_CHAT_ID = int(raw_admin_id)
+# Load variables from the .env file
+load_dotenv()
 
-# --- CONVERSATION STATES ---
-AWAITING_EMAIL_INFO, AWAITING_PAYMENT_INFO = range(2)
+# Read the token from the environment
+TOKEN = os.getenv("BOT_TOKEN")
 
-# --- LINKS & CONSTANTS ---
-OFFICIAL_CHANNEL_URL = "https://t.me/MailPayET"  # Replace with your Telegram Channel link
-WEBSITE_URL = "https://mailpay-ethiopia-bot.onrender.com"  # Replace with your Website URL
+if not TOKEN:
+    raise ValueError("Error: BOT_TOKEN is missing. Please check your .env file.")
 
-# --- IN-MEMORY SLOTS & SUBMISSIONS ---
-# You can update these slot details directly whenever you have new target accounts from buyers
+# Official Links & Support Info
+SUPPORT_USERNAME = "@CHUNKLA47"
+SUPPORT_URL = "https://t.me/CHUNKLA47"
+CHANNEL_URL = "https://t.me/MailPayEt"
+WEBSITE_URL = "https://mailpayet.github.io/daneildays-gmail.com/"
+
+# --- PREDEFINED GMAIL SLOTS ---
 SLOTS = {
     1: {
-        "email_format": "john.smith.et2026@gmail.com",
-        "password_req": "MailPay#2026",
-        "recovery_email": "rec.mailpay@gmail.com",
+        "first_name": "Yeshitila",
+        "last_name": "Lencho",
+        "email": "upapeqamep699@gmail.com",
+        "yob": "2001",
+        "password": "sJPwvyNeoit0J",
         "status": "AVAILABLE",
         "assigned_to": None,
         "assigned_at": None,
     },
     2: {
-        "email_format": "abebe.bikila.et26@gmail.com",
-        "password_req": "Ethiopia#2026",
-        "recovery_email": "rec.mailpay@gmail.com",
+        "first_name": "Mathewos",
+        "last_name": "Kidane",
+        "email": "osozosobeq893@gmail.com",
+        "yob": "1996",
+        "password": "UoNUj9oKgCnyTr",
         "status": "AVAILABLE",
         "assigned_to": None,
         "assigned_at": None,
     },
     3: {
-        "email_format": "kebede.chala.et26@gmail.com",
-        "password_req": "SecurePass#2026",
-        "recovery_email": "rec.mailpay@gmail.com",
+        "first_name": "Bereket",
+        "last_name": "Abdella",
+        "email": "vudijowuv738@gmail.com",
+        "yob": "2005",
+        "password": "34aagpUgngPv",
         "status": "AVAILABLE",
         "assigned_to": None,
         "assigned_at": None,
     },
 }
 
-submissions = {}
-submission_counter = 1000
 SLOT_TIMEOUT_MINUTES = 20
 
-
 def release_expired_slots():
-    """Auto-release slots if user didn't complete within 20 mins."""
+    """Auto-release slots if a user didn't complete within 20 minutes."""
     now = datetime.now()
     for slot_id, slot in SLOTS.items():
         if slot["status"] == "ASSIGNED" and slot["assigned_at"]:
@@ -94,96 +93,283 @@ def release_expired_slots():
                 slot["assigned_at"] = None
 
 
-def get_main_keyboard():
-    """Generates the comprehensive main menu keyboard."""
-    keyboard = [
-        [InlineKeyboardButton("➕ Create Gmail Account", callback_data="create_account")],
-        [
-            InlineKeyboardButton("ℹ️ How It Works", callback_data="how_it_works"),
-            InlineKeyboardButton("📌 Requirements & Rules", callback_data="rules")
-        ],
-        [
-            InlineKeyboardButton("💳 Payment Info", callback_data="payment_info"),
-            InlineKeyboardButton("📢 Official Channel", url=OFFICIAL_CHANNEL_URL)
-        ],
-        [InlineKeyboardButton("🌐 Visit Website", url=WEBSITE_URL)]
-    ]
-    return InlineKeyboardMarkup(keyboard)
+WELCOME = """👋 Welcome to MailPay 🇪🇹
+
+Looking for a simple way to earn?
+
+We provide the information you need to
+participate in our Gmail account service.
+
+Choose an option below 👇"""
+
+HOW_IT_WORKS = """📚 HOW IT WORKS
+
+1️⃣ Tap '➕ Get Gmail Task' to get your assigned target account details.
+
+2️⃣ Follow the exact First Name, Last Name, Email, Year of Birth, and Password given.
+
+3️⃣ Create the Gmail account using those details.
+
+4️⃣ Send evidence of creation to our support admin (@CHUNKLA47).
+
+5️⃣ Once verified (within 3 days), you receive 10 ETB per verified account!
+
+🔄 *Note:* The info email account will update every 24 hours.
+
+💡 Note: Once verified, you can safely log out / remove the created account from your device.
+
+💰 Payment: 10 ETB × number of verified accounts."""
+
+PAYMENT_INFO = """💰 PAYMENT INFO
+
+You will receive:
+
+10 ETB 💵 for each Gmail account
+that is successfully verified.
+
+📊 Example:
+• 1 verified account = 10 ETB
+• 5 verified accounts = 50 ETB
+• 10 verified accounts = 100 ETB
+
+⏳ VERIFICATION
+
+After you submit evidence of your account
+creation, we check your submission.
+
+Verification can take up to 3 days.
+
+Once your accounts are verified, we'll tell
+you when to send your payment information.
+
+🇪🇹 AVAILABLE PAYMENT METHODS
+
+• Telebirr
+• M-Pesa (Safaricom users)
+• Commercial Bank of Ethiopia (CBE)
+
+⚠️ Make sure your payment information is
+correct before sending it to us."""
+
+REQUIREMENTS = """📋 REQUIREMENTS & PAYMENT RULES
+
+Before participating, please read these rules carefully:
+
+🇪🇹 PAYMENT METHODS
+
+We only make payments through digital
+payment methods available in Ethiopia:
+
+• Telebirr — most commonly used
+• M-Pesa — for Safaricom users
+• Commercial Bank of Ethiopia (CBE)
+
+💰 PAYMENT PROCESS
+
+After your account has been checked and
+approved, we will tell you when to send
+your payment information.
+
+⚠️ IMPORTANT
+
+Please check your payment information
+carefully before sending it to us.
+
+If you provide an incorrect phone number
+or bank account number and the payment is
+sent to the wrong account, MailPay is not
+responsible for the mistake.
+
+Always double-check your information
+before submitting it."""
+
+FAQ_ANSWERS = {
+    "faq_earn": """💰 HOW MUCH DO I EARN?
+
+You receive 10 ETB 💵 for each Gmail account
+that is successfully verified.
+
+📊 Example:
+• 1 verified account = 10 ETB
+• 5 verified accounts = 50 ETB
+• 10 verified accounts = 100 ETB""",
+
+    "faq_paid": """⏱ WHEN WILL I GET PAID?
+
+We verify your submission within 3 days.
+
+Once your account(s) are verified, we'll tell
+you when to send your payment information.
+
+Payment is made after the verification process.""",
+
+    "faq_submit": """📨 HOW DO I SUBMIT AN ACCOUNT?
+
+Tap '➕ Get Gmail Task' on the main menu.
+
+Follow the details provided (Name, Email, Password, YOB) to create the account.
+
+After successfully creating the account, contact @CHUNKLA47 with the screenshot/evidence.""",
+
+    "faq_remove": """📱 HOW TO LOG OUT / REMOVE AN ACCOUNT FROM YOUR DEVICE
+
+After creating and submitting a Gmail account, you can safely remove it from your device:
+
+🤖 ANDROID:
+1. Open your phone **Settings**.
+2. Tap **Passwords & Accounts** (or **Users & Accounts**).
+3. Select the Gmail account you want to remove.
+4. Tap **Remove Account** and confirm.
+
+🍎 IPHONE / IPAD:
+1. Open phone **Settings**.
+2. Tap **Mail** (or **Accounts**).
+3. Tap **Accounts** -> Select the Gmail account.
+4. Tap **Delete Account** -> **Delete from My iPhone**.
+
+💻 COMPUTER / CHROME BROWSER:
+1. Go to **google.com** or **gmail.com**.
+2. Click your profile picture at the top right.
+3. Click **Sign out** (or **Sign out of all accounts**).
+4. Click **Remove an account** to clear it from the list.""",
+
+    "faq_rejected": """❌ WHAT IF MY SUBMISSION ISN'T VERIFIED?
+
+Only successfully verified accounts qualify
+for payment.
+
+If a submission does not meet the requirements,
+it may not be verified or paid.
+
+Make sure you follow the instructions provided
+by the admin carefully.""",
+
+    "faq_multiple": """🔢 CAN I SUBMIT MULTIPLE ACCOUNTS?
+
+You can submit multiple accounts, provided
+that each account follows the instructions
+and requirements provided by the admin.
+
+💰 Payment is calculated as:
+10 ETB × number of verified accounts.""",
+
+    "faq_methods": """💳 WHICH PAYMENT METHODS ARE AVAILABLE?
+
+We currently make payments through digital
+payment methods available in Ethiopia:
+
+• Telebirr
+• M-Pesa (for Safaricom users)
+• Commercial Bank of Ethiopia (CBE)
+
+We will tell you when to send your payment
+information after your account(s) are approved.""",
+
+    "faq_change": """🔄 CAN I CHANGE MY PAYMENT INFORMATION?
+
+If you need to change your payment information,
+contact support before sending your payment
+information.
+
+Always make sure the information you provide
+is correct.""",
+
+    "faq_missing": """😢 WHY HAVEN'T I RECEIVED MY PAYMENT?
+
+First, remember that your submission must be
+checked and verified.
+
+Verification can take up to 3 days.
+
+After approval, we'll tell you when to send
+your payment information.
+
+If the verification period has passed, contact
+support for help.""",
+}
 
 
-# --- USER FLOW HANDLERS ---
+def main_menu():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("➕ Get Gmail Task", callback_data="get_task")
+        ],
+        [
+            InlineKeyboardButton("📚 How It Works", callback_data="how_it_works"),
+            InlineKeyboardButton("💰 Payment Info", callback_data="payment_info")
+        ],
+        [
+            InlineKeyboardButton("📋 Requirements & Rules", callback_data="requirements"),
+            InlineKeyboardButton("❓ FAQ", callback_data="faq")
+        ],
+        [
+            InlineKeyboardButton("📢 Official Channel", url=CHANNEL_URL),
+            InlineKeyboardButton("🌐 Visit Website", url=WEBSITE_URL)
+        ],
+        [
+            InlineKeyboardButton("👤 Contact Support", callback_data="support")
+        ],
+    ])
+
+
+def back_main():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="main_menu")]
+    ])
+
+
+def faq_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💰 How much do I earn?", callback_data="faq_earn")],
+        [InlineKeyboardButton("⏱ When will I get paid?", callback_data="faq_paid")],
+        [InlineKeyboardButton("📨 How do I submit an account?", callback_data="faq_submit")],
+        [InlineKeyboardButton("📱 How to remove / log out account?", callback_data="faq_remove")],
+        [InlineKeyboardButton("❌ What if my submission isn't verified?", callback_data="faq_rejected")],
+        [InlineKeyboardButton("🔢 Can I submit multiple accounts?", callback_data="faq_multiple")],
+        [InlineKeyboardButton("💳 Which payment methods are available?", callback_data="faq_methods")],
+        [InlineKeyboardButton("🔄 Can I change my payment information?", callback_data="faq_change")],
+        [InlineKeyboardButton("😢 Why haven't I received my payment?", callback_data="faq_missing")],
+        [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="main_menu")],
+    ])
+
+
+def faq_back():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 Back to FAQ", callback_data="faq")],
+        [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")],
+    ])
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command handler."""
     await update.message.reply_text(
-        "👋 *Welcome to MailPay ET!*\n\n"
-        "Earn **10 ETB** for each verified Gmail account created using our specific target details.\n\n"
-        "Select an option below to get started or read our requirements.",
-        parse_mode="Markdown",
-        reply_markup=get_main_keyboard()
+        WELCOME,
+        reply_markup=main_menu()
     )
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles main menu inline buttons."""
+
+async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    data = query.data
 
-    back_keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="main_menu")]])
-
-    if query.data == "main_menu":
+    if data == "main_menu":
         await query.edit_message_text(
-            "👋 *Welcome to MailPay ET!*\n\n"
-            "Earn **10 ETB** for each verified Gmail account created using our specific target details.\n\n"
-            "Select an option below to get started or read our requirements.",
-            parse_mode="Markdown",
-            reply_markup=get_main_keyboard()
+            WELCOME,
+            reply_markup=main_menu()
         )
 
-    elif query.data == "how_it_works":
-        await query.edit_message_text(
-            "📋 *How MailPay ET Works:*\n\n"
-            "1️⃣ Tap **'➕ Create Gmail Account'** to receive assigned target creation details.\n"
-            "2️⃣ Go to Gmail / Google Sign-Up and create the account using the exact Email, Password, and Recovery Email provided.\n"
-            "3️⃣ Return here, tap **'✅ I Have Created It'**, and submit your created credentials.\n"
-            "4️⃣ Enter your Telebirr or CBE account details.\n"
-            "5️⃣ Once verified by our admin, receive **10 ETB** credited within 3 days!",
-            parse_mode="Markdown",
-            reply_markup=back_keyboard
-        )
-
-    elif query.data == "rules":
-        await query.edit_message_text(
-            "📌 *Account Requirements & Creation Rules:*\n\n"
-            "• **Exact Match:** You MUST use the exact Gmail address handle and password assigned to your slot.\n"
-            "• **Recovery Email:** Always add the specified recovery email address during account setup.\n"
-            "• **Phone Verification:** Use a valid Ethiopian phone number if Google prompts for SMS verification.\n"
-            "• **Time Limit:** Each slot reservation lasts for **20 minutes**. Incomplete slots will auto-expire.\n"
-            "• **No Duplicates:** Submitting fake or already-existing accounts will lead to a permanent ban.",
-            parse_mode="Markdown",
-            reply_markup=back_keyboard
-        )
-
-    elif query.data == "payment_info":
-        await query.edit_message_text(
-            "💳 *Payment Rates & Payout Details:*\n\n"
-            "💰 **Rate:** 10.00 ETB per approved Gmail account\n"
-            "🏦 **Supported Payment Methods:** Telebirr & Commercial Bank of Ethiopia (CBE)\n"
-            "⏱ **Payout Speed:** Processed within 24 to 72 hours following admin verification\n\n"
-            "Ensure your account name and phone/account number match accurately upon submission.",
-            parse_mode="Markdown",
-            reply_markup=back_keyboard
-        )
-
-    elif query.data == "create_account":
+    elif data == "get_task":
         release_expired_slots()
         user_id = query.from_user.id
         assigned_slot_id = None
 
+        # Check if user already holds an assigned slot
         for sid, slot in SLOTS.items():
             if slot["assigned_to"] == user_id and slot["status"] == "ASSIGNED":
                 assigned_slot_id = sid
                 break
 
+        # If not, assign the first available slot
         if not assigned_slot_id:
             for sid, slot in SLOTS.items():
                 if slot["status"] == "AVAILABLE":
@@ -195,198 +381,108 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not assigned_slot_id:
             await query.edit_message_text(
-                "⚠️ *All active creation slots are currently occupied!*\n\n"
-                "Please check back in 10–15 minutes as slots automatically free up.",
+                "⚠️ *All available account tasks are currently in use!*\n\n"
+                "Please check back in 15–20 minutes once a task frees up.",
                 parse_mode="Markdown",
-                reply_markup=back_keyboard
+                reply_markup=back_main()
             )
-            return ConversationHandler.END
+            return
 
-        context.user_data["current_slot"] = assigned_slot_id
         slot_data = SLOTS[assigned_slot_id]
 
         task_keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ I Have Created It", callback_data="task_done")],
+            [InlineKeyboardButton("💬 Submit Evidence to Support", url=SUPPORT_URL)],
             [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="main_menu")]
         ])
 
+        task_msg = (
+            f"🎯 *ASSIGNED GMAIL TASK (Slot #{assigned_slot_id})*\n\n"
+            f"Please create the Gmail account using these **EXACT** details:\n\n"
+            f"👤 **First Name:** `{slot_data['first_name']}`\n"
+            f"👤 **Last Name:** `{slot_data['last_name']}`\n"
+            f"📧 **Email:** `{slot_data['email']}`\n"
+            f"🎂 **Year of Birth:** `{slot_data['yob']}`\n"
+            f"🔑 **Password:** `{slot_data['password']}`\n\n"
+            f"⏱ *Time Limit:* 20 Minutes\n"
+            f"🔄 *Note:* The info email account will update every 24 hours.\n\n"
+            f"Once created, send your verification evidence to support: {SUPPORT_USERNAME}"
+        )
+
         await query.edit_message_text(
-            f"🎯 *Task Assigned! (Slot #{assigned_slot_id})*\n\n"
-            f"Please create a Gmail account with these **EXACT** details:\n\n"
-            f"📧 **Target Email:** `{slot_data['email_format']}`\n"
-            f"🔑 **Password:** `{slot_data['password_req']}`\n"
-            f"🛡 **Recovery Email:** `{slot_data['recovery_email']}`\n\n"
-            f"⏱ *Time Limit:* 20 Minutes\n\n"
-            f"Tap **'✅ I Have Created It'** once done to submit.",
+            task_msg,
             parse_mode="Markdown",
             reply_markup=task_keyboard
         )
 
-async def task_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Prompts user for final created credentials."""
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text(
-        "📝 Please reply with the created **Gmail address** and **Password** to confirm:\n\n"
-        "Example: `example@gmail.com | MyPassword123`",
-        parse_mode="Markdown"
-    )
-    return AWAITING_EMAIL_INFO
-
-async def receive_email_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Stores credentials and prompts for payout details."""
-    context.user_data["submission_email"] = update.message.text
-    await update.message.reply_text(
-        "💳 Enter your **Payment Details** (Telebirr or CBE account number + Account Name):\n\n"
-        "Example: `Telebirr - 0912345678 (Zablon)`",
-        parse_mode="Markdown"
-    )
-    return AWAITING_PAYMENT_INFO
-
-async def receive_payment_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Finalizes submission and alerts Admin Panel."""
-    global submission_counter
-    user = update.message.from_user
-    context.user_data["submission_payment"] = update.message.text
-    
-    submission_id = submission_counter
-    submission_counter += 1
-    slot_id = context.user_data.get("current_slot")
-    
-    submissions[submission_id] = {
-        "user_id": user.id,
-        "username": user.username or user.first_name,
-        "email_info": context.user_data["submission_email"],
-        "payment_info": context.user_data["submission_payment"],
-        "status": "PENDING",
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    }
-
-    if slot_id and slot_id in SLOTS:
-        SLOTS[slot_id]["status"] = "AVAILABLE"
-        SLOTS[slot_id]["assigned_to"] = None
-        SLOTS[slot_id]["assigned_at"] = None
-
-    await update.message.reply_text(
-        f"✅ *Submission Received! (Ref #{submission_id})*\n\n"
-        f"Your account credentials are now pending admin verification.\n"
-        f"Upon approval, **10 ETB** will be transferred to your account within 3 days.",
-        parse_mode="Markdown",
-        reply_markup=get_main_keyboard()
-    )
-
-    admin_keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Approve (Pay 10 ETB)", callback_data=f"admin_approve_{submission_id}"),
-            InlineKeyboardButton("❌ Reject", callback_data=f"admin_reject_{submission_id}")
-        ]
-    ])
-
-    admin_msg = (
-        f"📩 *NEW GMAIL SUBMISSION #{submission_id}*\n"
-        f"──────────────────────────────\n"
-        f"👤 *User:* @{user.username or user.first_name} (ID: `{user.id}`)\n"
-        f"📧 *Submitted Credentials:* `{context.user_data['submission_email']}`\n"
-        f"🏦 *Payment Info:* `{context.user_data['submission_payment']}`\n"
-        f"⏱ *Time:* {submissions[submission_id]['timestamp']}\n"
-        f"──────────────────────────────\n"
-        f"Status: ⏳ Pending Verification"
-    )
-
-    await context.bot.send_message(
-        chat_id=ADMIN_CHAT_ID,
-        text=admin_msg,
-        parse_mode="Markdown",
-        reply_markup=admin_keyboard
-    )
-
-    return ConversationHandler.END
-
-async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancels current interactive sequence."""
-    await update.message.reply_text("Process cancelled.", reply_markup=get_main_keyboard())
-    return ConversationHandler.END
-
-
-# --- ADMIN PANEL HANDLERS ---
-
-async def admin_decision_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processes Approve and Reject actions from Admin."""
-    query = update.callback_query
-    await query.answer()
-
-    data = query.data
-    action, sub_id_str = data.rsplit("_", 1)
-    sub_id = int(sub_id_str)
-
-    if sub_id not in submissions:
-        await query.edit_message_text("❌ Submission not found or already processed.")
-        return
-
-    sub_data = submissions[sub_id]
-
-    if action == "admin_approve":
-        sub_data["status"] = "APPROVED"
+    elif data == "how_it_works":
         await query.edit_message_text(
-            f"✅ *SUBMISSION #{sub_id} APPROVED*\n\n"
-            f"User: @{sub_data['username']}\n"
-            f"Payment Details: `{sub_data['payment_info']}`\n"
-            f"Status: Approved & Scheduled for Payment!",
-            parse_mode="Markdown"
+            HOW_IT_WORKS,
+            reply_markup=back_main()
         )
-        try:
-            await context.bot.send_message(
-                chat_id=sub_data["user_id"],
-                text=f"🎉 *Account Approved!*\n\nYour submission (#{sub_id}) was verified. "
-                     f"Your 10 ETB payment is scheduled for: `{sub_data['payment_info']}`.",
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            logging.error(f"Failed to notify user: {e}")
 
-    elif action == "admin_reject":
-        sub_data["status"] = "REJECTED"
+    elif data == "payment_info":
         await query.edit_message_text(
-            f"❌ *SUBMISSION #{sub_id} REJECTED*\n\n"
-            f"User: @{sub_data['username']}\n"
-            f"Credentials: `{sub_data['email_info']}`",
-            parse_mode="Markdown"
+            PAYMENT_INFO,
+            reply_markup=back_main()
         )
-        try:
-            await context.bot.send_message(
-                chat_id=sub_data["user_id"],
-                text=f"❌ *Submission Rejected*\n\n"
-                     f"Your submission (#{sub_id}) could not be verified. "
-                     f"Please ensure you followed all requirements and try again.",
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            logging.error(f"Failed to notify user: {e}")
+
+    elif data == "requirements":
+        await query.edit_message_text(
+            REQUIREMENTS,
+            reply_markup=back_main()
+        )
+
+    elif data == "faq":
+        await query.edit_message_text(
+            "❓ FREQUENTLY ASKED QUESTIONS\n\nChoose a question below 👇",
+            reply_markup=faq_menu()
+        )
+
+    elif data in FAQ_ANSWERS:
+        await query.edit_message_text(
+            FAQ_ANSWERS[data],
+            reply_markup=faq_back()
+        )
+
+    elif data == "support":
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💬 Contact Support Admin", url=SUPPORT_URL)],
+            [InlineKeyboardButton("📢 Official Channel", url=CHANNEL_URL)],
+            [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="main_menu")],
+        ])
+
+        await query.edit_message_text(
+            f"""👤 CONTACT SUPPORT
+
+Need help or have a question?
+
+Contact our support admin:
+{SUPPORT_USERNAME}
+
+Or visit our official channel:
+{CHANNEL_URL}
+
+Tap a button below to proceed:""",
+            reply_markup=keyboard,
+        )
 
 
-# --- MAIN APPLICATION STARTUP ---
-
-def main():
-    threading.Thread(target=run_health_server, daemon=True).start()
-
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    conv_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(task_done_callback, pattern="^task_done$")],
-        states={
-            AWAITING_EMAIL_INFO: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_email_info)],
-            AWAITING_PAYMENT_INFO: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_payment_info)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        WELCOME,
+        reply_markup=main_menu()
     )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button_handler, pattern="^(create_account|how_it_works|rules|payment_info|main_menu)$"))
-    app.add_handler(conv_handler)
-    app.add_handler(CallbackQueryHandler(admin_decision_handler, pattern="^admin_(approve|reject)_"))
-
-    logging.info("Bot starting...")
-    app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    # Start background web server to pass Render port scan
+    threading.Thread(target=run_health_server, daemon=True).start()
+
+    app = Application.builder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CallbackQueryHandler(buttons))
+
+    print("MailPay Ethiopia bot is running...")
+    app.run_polling()
