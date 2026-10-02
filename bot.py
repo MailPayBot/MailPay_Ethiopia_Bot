@@ -19,7 +19,7 @@ WAITING_PAYMENT_METHOD, WAITING_PAYMENT_DETAILS, WAITING_RECEIPT_PHOTO = range(3
 
 # --- Admin Telegram Chat ID ---
 # Replace 123456789 with your actual Telegram numeric User ID!
-ADMIN_CHAT_ID = 982922116
+ADMIN_CHAT_ID = 123456789
 
 # --- Thread Lock to Prevent Race Conditions ---
 SLOT_LOCK = threading.Lock()
@@ -110,6 +110,23 @@ def release_expired_slots():
                 slot["status"] = "AVAILABLE"
                 slot["assigned_to"] = None
                 slot["assigned_at"] = None
+
+
+def get_soonest_available_wait_time():
+    """Calculates the remaining minutes until the earliest active task expires."""
+    now = datetime.now()
+    soonest_expiry = None
+
+    for slot_id, slot in SLOTS.items():
+        if slot["status"] == "ASSIGNED" and slot["assigned_at"]:
+            expiry = slot["assigned_at"] + timedelta(minutes=SLOT_TIMEOUT_MINUTES)
+            if soonest_expiry is None or expiry < soonest_expiry:
+                soonest_expiry = expiry
+
+    if soonest_expiry and soonest_expiry > now:
+        remaining_seconds = int((soonest_expiry - now).total_seconds())
+        return (remaining_seconds // 60) + 1
+    return 5  # Default fallback wait time in minutes
 
 
 WELCOME = """👋 Welcome to MailPay 🇪🇹
@@ -293,7 +310,6 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = query.from_user.id
         now = datetime.now()
 
-        # Thread safety lock prevents multiple users grabbing the same slot simultaneously
         with SLOT_LOCK:
             # 1. Check if user is in rejection cooldown
             if user_id in REJECTED_USER_LOCKS:
@@ -313,7 +329,6 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                     return
                 else:
-                    # Cooldown finished! Re-assign the exact same slot back to user
                     assigned_slot_id = lock_info["slot_id"]
                     SLOTS[assigned_slot_id]["status"] = "ASSIGNED"
                     SLOTS[assigned_slot_id]["assigned_to"] = user_id
@@ -342,11 +357,13 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             assigned_slot_id = sid
                             break
 
+        # If no slot is open, calculate dynamic countdown timer
         if not assigned_slot_id:
+            wait_minutes = get_soonest_available_wait_time()
             await query.edit_message_text(
-                "⚠️ *No new Gmail tasks available right now!*\n\n"
-                "All tasks have either been completed or are currently in progress by other users. "
-                "Please check back later!",
+                f"⏳ *ALL GMAIL TASKS ARE CURRENTLY OCCUPIED!*\n\n"
+                f"Other users are currently completing the available tasks.\n\n"
+                f"⏱ **Please come back and try again in {wait_minutes} minute(s).**",
                 parse_mode="Markdown",
                 reply_markup=back_main(),
             )
@@ -444,7 +461,6 @@ async def receive_payment_details(update: Update, context: ContextTypes.DEFAULT_
     method = context.user_data.get("payment_method", "Unknown Method")
     user = update.message.from_user
 
-    # Find user's assigned slot
     assigned_slot = None
     with SLOT_LOCK:
         for sid, slot in SLOTS.items():
@@ -454,7 +470,6 @@ async def receive_payment_details(update: Update, context: ContextTypes.DEFAULT_
 
     slot_email = assigned_slot["email"] if assigned_slot else "Unknown Email"
 
-    # Send notification to Admin with Approve / Reject buttons
     if ADMIN_CHAT_ID:
         try:
             admin_msg = (
@@ -479,7 +494,6 @@ async def receive_payment_details(update: Update, context: ContextTypes.DEFAULT_
         except Exception as e:
             print(f"Failed to send notification to admin: {e}")
 
-    # Confirmation message to user with receipt promise
     await update.message.reply_text(
         "🎉 *You have successfully submitted the account details!*\n\n"
         "Your submission is under review. Once verified, you will get paid **10 ETB** per account "
@@ -499,12 +513,11 @@ async def admin_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = query.data
     parts = data.split("_")
-    action = parts[1]  # 'approve' or 'reject'
+    action = parts[1]
     target_user_id = int(parts[2])
 
     if action == "approve":
         with SLOT_LOCK:
-            # Mark the slot COMPLETED so NO OTHER USER ever receives this email address
             for sid, slot in SLOTS.items():
                 if slot["assigned_to"] == target_user_id:
                     slot["status"] = "COMPLETED"
