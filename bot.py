@@ -29,7 +29,6 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"MailPay ET Bot is running successfully!")
 
     def log_message(self, format, *args):
-        # Silence default HTTP server access logs to keep terminal clean
         return
 
 def run_health_server():
@@ -38,34 +37,41 @@ def run_health_server():
     logging.info(f"Health check web server running on port {port}")
     server.serve_forever()
 
-# --- READ ENVIRONMENT VARIABLES ---
+# --- ENVIRONMENT VARIABLES ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-
 raw_admin_id = os.getenv("ADMIN_CHAT_ID", "982922116").strip().replace('"', '').replace("'", "")
 ADMIN_CHAT_ID = int(raw_admin_id)
 
 # --- CONVERSATION STATES ---
 AWAITING_EMAIL_INFO, AWAITING_PAYMENT_INFO = range(2)
 
-# --- IN-MEMORY DATABASE & SLOTS (3-Slot Buffer) ---
+# --- LINKS & CONSTANTS ---
+OFFICIAL_CHANNEL_URL = "https://t.me/MailPayET"  # Replace with your Telegram Channel link
+WEBSITE_URL = "https://mailpay-ethiopia-bot.onrender.com"  # Replace with your Website URL
+
+# --- IN-MEMORY SLOTS & SUBMISSIONS ---
+# You can update these slot details directly whenever you have new target accounts from buyers
 SLOTS = {
     1: {
-        "provider": "Agency Slot 1",
-        "info": "Format: Firstname Lastname + 3 random numbers (e.g. JohnDoe482@gmail.com)\nPassword rules: Strong password with symbols (e.g. Pass#2026!)",
+        "email_format": "john.smith.et2026@gmail.com",
+        "password_req": "MailPay#2026",
+        "recovery_email": "rec.mailpay@gmail.com",
         "status": "AVAILABLE",
         "assigned_to": None,
         "assigned_at": None,
     },
     2: {
-        "provider": "Agency Slot 2",
-        "info": "Format: Standard English names only\nPassword rules: Must end with 2026 (e.g. Account2026)",
+        "email_format": "abebe.bikila.et26@gmail.com",
+        "password_req": "Ethiopia#2026",
+        "recovery_email": "rec.mailpay@gmail.com",
         "status": "AVAILABLE",
         "assigned_to": None,
         "assigned_at": None,
     },
     3: {
-        "provider": "Agency Slot 3",
-        "info": "Format: Random 8-character string\nPassword rules: Minimum 10 characters",
+        "email_format": "kebede.chala.et26@gmail.com",
+        "password_req": "SecurePass#2026",
+        "recovery_email": "rec.mailpay@gmail.com",
         "status": "AVAILABLE",
         "assigned_to": None,
         "assigned_at": None,
@@ -88,20 +94,33 @@ def release_expired_slots():
                 slot["assigned_at"] = None
 
 
+def get_main_keyboard():
+    """Generates the comprehensive main menu keyboard."""
+    keyboard = [
+        [InlineKeyboardButton("➕ Create Gmail Account", callback_data="create_account")],
+        [
+            InlineKeyboardButton("ℹ️ How It Works", callback_data="how_it_works"),
+            InlineKeyboardButton("📌 Requirements & Rules", callback_data="rules")
+        ],
+        [
+            InlineKeyboardButton("💳 Payment Info", callback_data="payment_info"),
+            InlineKeyboardButton("📢 Official Channel", url=OFFICIAL_CHANNEL_URL)
+        ],
+        [InlineKeyboardButton("🌐 Visit Website", url=WEBSITE_URL)]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
 # --- USER FLOW HANDLERS ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command handler."""
-    keyboard = [
-        [InlineKeyboardButton("➕ Create Gmail Account", callback_data="create_account")],
-        [InlineKeyboardButton("ℹ️ How It Works", callback_data="how_it_works")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
-        "👋 Welcome to MailPay ET!\n\n"
-        "Earn 10 ETB for each verified Gmail account created using our admin instructions. "
-        "Payouts are processed within 3 days of approval.",
-        reply_markup=reply_markup
+        "👋 *Welcome to MailPay ET!*\n\n"
+        "Earn **10 ETB** for each verified Gmail account created using our specific target details.\n\n"
+        "Select an option below to get started or read our requirements.",
+        parse_mode="Markdown",
+        reply_markup=get_main_keyboard()
     )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -109,20 +128,56 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    if query.data == "how_it_works":
+    back_keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="main_menu")]])
+
+    if query.data == "main_menu":
+        await query.edit_message_text(
+            "👋 *Welcome to MailPay ET!*\n\n"
+            "Earn **10 ETB** for each verified Gmail account created using our specific target details.\n\n"
+            "Select an option below to get started or read our requirements.",
+            parse_mode="Markdown",
+            reply_markup=get_main_keyboard()
+        )
+
+    elif query.data == "how_it_works":
         await query.edit_message_text(
             "📋 *How MailPay ET Works:*\n\n"
-            "1️⃣ Tap 'Create Gmail Account' to get an active slot and creation instructions.\n"
-            "2️⃣ Follow the exact creation format given by the admin.\n"
-            "3️⃣ Submit the created Gmail & password + your Telebirr/CBE payout details.\n"
-            "4️⃣ Once verified by admin, you will receive 10 ETB within 3 days!",
-            parse_mode="Markdown"
+            "1️⃣ Tap **'➕ Create Gmail Account'** to receive assigned target creation details.\n"
+            "2️⃣ Go to Gmail / Google Sign-Up and create the account using the exact Email, Password, and Recovery Email provided.\n"
+            "3️⃣ Return here, tap **'✅ I Have Created It'**, and submit your created credentials.\n"
+            "4️⃣ Enter your Telebirr or CBE account details.\n"
+            "5️⃣ Once verified by our admin, receive **10 ETB** credited within 3 days!",
+            parse_mode="Markdown",
+            reply_markup=back_keyboard
         )
+
+    elif query.data == "rules":
+        await query.edit_message_text(
+            "📌 *Account Requirements & Creation Rules:*\n\n"
+            "• **Exact Match:** You MUST use the exact Gmail address handle and password assigned to your slot.\n"
+            "• **Recovery Email:** Always add the specified recovery email address during account setup.\n"
+            "• **Phone Verification:** Use a valid Ethiopian phone number if Google prompts for SMS verification.\n"
+            "• **Time Limit:** Each slot reservation lasts for **20 minutes**. Incomplete slots will auto-expire.\n"
+            "• **No Duplicates:** Submitting fake or already-existing accounts will lead to a permanent ban.",
+            parse_mode="Markdown",
+            reply_markup=back_keyboard
+        )
+
+    elif query.data == "payment_info":
+        await query.edit_message_text(
+            "💳 *Payment Rates & Payout Details:*\n\n"
+            "💰 **Rate:** 10.00 ETB per approved Gmail account\n"
+            "🏦 **Supported Payment Methods:** Telebirr & Commercial Bank of Ethiopia (CBE)\n"
+            "⏱ **Payout Speed:** Processed within 24 to 72 hours following admin verification\n\n"
+            "Ensure your account name and phone/account number match accurately upon submission.",
+            parse_mode="Markdown",
+            reply_markup=back_keyboard
+        )
+
     elif query.data == "create_account":
         release_expired_slots()
-        
-        assigned_slot_id = None
         user_id = query.from_user.id
+        assigned_slot_id = None
 
         for sid, slot in SLOTS.items():
             if slot["assigned_to"] == user_id and slot["status"] == "ASSIGNED":
@@ -140,43 +195,49 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not assigned_slot_id:
             await query.edit_message_text(
-                "⚠️ All 3 active creation slots are currently in use!\n\n"
-                "Please try again in 15–20 minutes once a slot frees up."
+                "⚠️ *All active creation slots are currently occupied!*\n\n"
+                "Please check back in 10–15 minutes as slots automatically free up.",
+                parse_mode="Markdown",
+                reply_markup=back_keyboard
             )
             return ConversationHandler.END
 
         context.user_data["current_slot"] = assigned_slot_id
-
-        keyboard = [[InlineKeyboardButton("✅ I Have Created It", callback_data="task_done")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
         slot_data = SLOTS[assigned_slot_id]
+
+        task_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ I Have Created It", callback_data="task_done")],
+            [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="main_menu")]
+        ])
+
         await query.edit_message_text(
             f"🎯 *Task Assigned! (Slot #{assigned_slot_id})*\n\n"
-            f"📌 *Admin Instructions for Creation:*\n"
-            f"{slot_data['info']}\n\n"
-            f"⚠ *Important:* You have 20 minutes to complete this slot. "
-            f"Once created, tap the button below to submit your credentials.",
+            f"Please create a Gmail account with these **EXACT** details:\n\n"
+            f"📧 **Target Email:** `{slot_data['email_format']}`\n"
+            f"🔑 **Password:** `{slot_data['password_req']}`\n"
+            f"🛡 **Recovery Email:** `{slot_data['recovery_email']}`\n\n"
+            f"⏱ *Time Limit:* 20 Minutes\n\n"
+            f"Tap **'✅ I Have Created It'** once done to submit.",
             parse_mode="Markdown",
-            reply_markup=reply_markup
+            reply_markup=task_keyboard
         )
 
 async def task_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Prompts user for Gmail credentials."""
+    """Prompts user for final created credentials."""
     query = update.callback_query
     await query.answer()
     await query.edit_message_text(
-        "📝 Please reply with the *Gmail address* and *Password* you created:\n\n"
+        "📝 Please reply with the created **Gmail address** and **Password** to confirm:\n\n"
         "Example: `example@gmail.com | MyPassword123`",
         parse_mode="Markdown"
     )
     return AWAITING_EMAIL_INFO
 
 async def receive_email_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Stores email info and prompts for payment details."""
+    """Stores credentials and prompts for payout details."""
     context.user_data["submission_email"] = update.message.text
     await update.message.reply_text(
-        "💳 Great! Now enter your *Payment Info* (Telebirr or CBE account number and Account Name):\n\n"
+        "💳 Enter your **Payment Details** (Telebirr or CBE account number + Account Name):\n\n"
         "Example: `Telebirr - 0912345678 (Zablon)`",
         parse_mode="Markdown"
     )
@@ -190,7 +251,6 @@ async def receive_payment_info(update: Update, context: ContextTypes.DEFAULT_TYP
     
     submission_id = submission_counter
     submission_counter += 1
-
     slot_id = context.user_data.get("current_slot")
     
     submissions[submission_id] = {
@@ -209,26 +269,26 @@ async def receive_payment_info(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await update.message.reply_text(
         f"✅ *Submission Received! (Ref #{submission_id})*\n\n"
-        f"Your Gmail submission is now pending verification.\n"
-        f"Once verified, 10 ETB will be sent to your payment info within 3 days.",
-        parse_mode="Markdown"
+        f"Your account credentials are now pending admin verification.\n"
+        f"Upon approval, **10 ETB** will be transferred to your account within 3 days.",
+        parse_mode="Markdown",
+        reply_markup=get_main_keyboard()
     )
 
-    admin_keyboard = [
+    admin_keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✅ Approve (Pay 10 ETB)", callback_data=f"admin_approve_{submission_id}"),
             InlineKeyboardButton("❌ Reject", callback_data=f"admin_reject_{submission_id}")
         ]
-    ]
-    admin_markup = InlineKeyboardMarkup(admin_keyboard)
+    ])
 
     admin_msg = (
         f"📩 *NEW GMAIL SUBMISSION #{submission_id}*\n"
         f"──────────────────────────────\n"
         f"👤 *User:* @{user.username or user.first_name} (ID: `{user.id}`)\n"
-        f"📧 *Credentials:* `{context.user_data['submission_email']}`\n"
-        f"🏦 *Payment Details:* `{context.user_data['submission_payment']}`\n"
-        f"⏱ *Submitted:* {submissions[submission_id]['timestamp']}\n"
+        f"📧 *Submitted Credentials:* `{context.user_data['submission_email']}`\n"
+        f"🏦 *Payment Info:* `{context.user_data['submission_payment']}`\n"
+        f"⏱ *Time:* {submissions[submission_id]['timestamp']}\n"
         f"──────────────────────────────\n"
         f"Status: ⏳ Pending Verification"
     )
@@ -237,21 +297,21 @@ async def receive_payment_info(update: Update, context: ContextTypes.DEFAULT_TYP
         chat_id=ADMIN_CHAT_ID,
         text=admin_msg,
         parse_mode="Markdown",
-        reply_markup=admin_markup
+        reply_markup=admin_keyboard
     )
 
     return ConversationHandler.END
 
 async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancels conversation if user types /cancel."""
-    await update.message.reply_text("Process cancelled.")
+    """Cancels current interactive sequence."""
+    await update.message.reply_text("Process cancelled.", reply_markup=get_main_keyboard())
     return ConversationHandler.END
 
 
 # --- ADMIN PANEL HANDLERS ---
 
 async def admin_decision_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processes Approve and Reject buttons pressed by Admin."""
+    """Processes Approve and Reject actions from Admin."""
     query = update.callback_query
     await query.answer()
 
@@ -267,51 +327,46 @@ async def admin_decision_handler(update: Update, context: ContextTypes.DEFAULT_T
 
     if action == "admin_approve":
         sub_data["status"] = "APPROVED"
-        
         await query.edit_message_text(
-            f"✅ *SUBMISSION #{sub_id} APPROVED*\n"
+            f"✅ *SUBMISSION #{sub_id} APPROVED*\n\n"
             f"User: @{sub_data['username']}\n"
             f"Payment Details: `{sub_data['payment_info']}`\n"
-            f"Status: Approved & Scheduled for Payout!",
+            f"Status: Approved & Scheduled for Payment!",
             parse_mode="Markdown"
         )
-
         try:
             await context.bot.send_message(
                 chat_id=sub_data["user_id"],
-                text=f"🎉 *Account Approved!*\n\nYour Gmail submission (#{sub_id}) has been verified. "
-                     f"Your 10 ETB payment is being processed to: `{sub_data['payment_info']}`.",
+                text=f"🎉 *Account Approved!*\n\nYour submission (#{sub_id}) was verified. "
+                     f"Your 10 ETB payment is scheduled for: `{sub_data['payment_info']}`.",
                 parse_mode="Markdown"
             )
         except Exception as e:
-            logging.error(f"Could not notify user: {e}")
+            logging.error(f"Failed to notify user: {e}")
 
     elif action == "admin_reject":
         sub_data["status"] = "REJECTED"
-
         await query.edit_message_text(
-            f"❌ *SUBMISSION #{sub_id} REJECTED*\n"
+            f"❌ *SUBMISSION #{sub_id} REJECTED*\n\n"
             f"User: @{sub_data['username']}\n"
-            f"Email: `{sub_data['email_info']}`",
+            f"Credentials: `{sub_data['email_info']}`",
             parse_mode="Markdown"
         )
-
         try:
             await context.bot.send_message(
                 chat_id=sub_data["user_id"],
                 text=f"❌ *Submission Rejected*\n\n"
-                     f"Your Gmail submission (#{sub_id}) could not be verified or did not meet requirements. "
-                     f"Please try again or contact support.",
+                     f"Your submission (#{sub_id}) could not be verified. "
+                     f"Please ensure you followed all requirements and try again.",
                 parse_mode="Markdown"
             )
         except Exception as e:
-            logging.error(f"Could not notify user: {e}")
+            logging.error(f"Failed to notify user: {e}")
 
 
 # --- MAIN APPLICATION STARTUP ---
 
 def main():
-    # Start the keep-alive web server in a background thread
     threading.Thread(target=run_health_server, daemon=True).start()
 
     app = Application.builder().token(BOT_TOKEN).build()
@@ -326,7 +381,7 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button_handler, pattern="^(create_account|how_it_works)$"))
+    app.add_handler(CallbackQueryHandler(button_handler, pattern="^(create_account|how_it_works|rules|payment_info|main_menu)$"))
     app.add_handler(conv_handler)
     app.add_handler(CallbackQueryHandler(admin_decision_handler, pattern="^admin_(approve|reject)_"))
 
