@@ -1,6 +1,9 @@
 import os
 import logging
 from datetime import datetime, timedelta
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -17,10 +20,27 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 
-# --- READ ENVIRONMENT VARIABLES DIRECTLY FROM RENDER ---
+# --- KEEP-ALIVE HTTP SERVER FOR RENDER WEB SERVICE ---
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/html")
+        self.end_headers()
+        self.wfile.write(b"MailPay ET Bot is running successfully!")
+
+    def log_message(self, format, *args):
+        # Silence default HTTP server access logs to keep terminal clean
+        return
+
+def run_health_server():
+    port = int(os.getenv("PORT", "8080"))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    logging.info(f"Health check web server running on port {port}")
+    server.serve_forever()
+
+# --- READ ENVIRONMENT VARIABLES ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# Cleanly parse ADMIN_CHAT_ID avoiding string conversion errors
 raw_admin_id = os.getenv("ADMIN_CHAT_ID", "982922116").strip().replace('"', '').replace("'", "")
 ADMIN_CHAT_ID = int(raw_admin_id)
 
@@ -135,7 +155,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🎯 *Task Assigned! (Slot #{assigned_slot_id})*\n\n"
             f"📌 *Admin Instructions for Creation:*\n"
             f"{slot_data['info']}\n\n"
-            f"⚠️️ *Important:* You have 20 minutes to complete this slot. "
+            f"⚠ *Important:* You have 20 minutes to complete this slot. "
             f"Once created, tap the button below to submit your credentials.",
             parse_mode="Markdown",
             reply_markup=reply_markup
@@ -291,6 +311,9 @@ async def admin_decision_handler(update: Update, context: ContextTypes.DEFAULT_T
 # --- MAIN APPLICATION STARTUP ---
 
 def main():
+    # Start the keep-alive web server in a background thread
+    threading.Thread(target=run_health_server, daemon=True).start()
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     conv_handler = ConversationHandler(
