@@ -19,7 +19,7 @@ WAITING_PAYMENT_METHOD, WAITING_PAYMENT_DETAILS = range(2)
 
 # --- Admin Telegram Chat ID ---
 # Replace this with your actual Telegram User ID so the bot sends notifications directly to you!
-ADMIN_CHAT_ID = 123456789  
+ADMIN_CHAT_ID =   982922116
 
 # --- Render Port-Check Server ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
