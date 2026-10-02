@@ -116,7 +116,7 @@ HOW_IT_WORKS = """📚 HOW IT WORKS
 
 4️⃣ Tap '✅ I Have Created the Account' and submit your payment details.
 
-5️⃣ Once verified (within 3 days), you receive 10 ETB per verified account!
+5️⃣ Once verified (within 3 days), you receive 10 ETB per verified account and a payment receipt directly in chat!
 
 🔄 *Note:* The info email account will update every 24 hours.
 
@@ -143,8 +143,7 @@ creation, we check your submission.
 
 Verification can take up to 3 days.
 
-Once your accounts are verified, we'll tell
-you when to send your payment information.
+Once your accounts are verified, we will send you the receipt that we have sent it to your account.
 
 🇪🇹 AVAILABLE PAYMENT METHODS
 
@@ -171,8 +170,7 @@ payment methods available in Ethiopia:
 💰 PAYMENT PROCESS
 
 After your account has been checked and
-approved, we will tell you when to send
-your payment information.
+approved, we will send you your payment along with the transfer receipt.
 
 ⚠️ IMPORTANT
 
@@ -192,7 +190,7 @@ that is successfully verified.""",
     "faq_paid": """⏱ WHEN WILL I GET PAID?
 
 We verify your submission within 3 days.
-Payment is made after the verification process.""",
+Payment and the payment receipt are sent after verification.""",
     "faq_submit": """📨 HOW DO I SUBMIT AN ACCOUNT?
 
 Tap '➕ Get Gmail Task', follow the account details, and click '✅ I Have Created the Account' when finished.""",
@@ -430,10 +428,11 @@ async def receive_payment_details(update: Update, context: ContextTypes.DEFAULT_
         except Exception as e:
             print(f"Failed to send notification to admin: {e}")
 
-    # Confirmation message to user
+    # Confirmation message to user with receipt promise
     await update.message.reply_text(
         "🎉 *You have successfully submitted the account details!*\n\n"
-        "Your submission is under review. Once verified, you will get paid **10 ETB** per account.\n\n"
+        "Your submission is under review. Once verified, you will get paid **10 ETB** per account "
+        "and we will send you the receipt that we have sent it to your account once verified.\n\n"
         "Thank you for participating with MailPay 🇪🇹",
         parse_mode="Markdown",
         reply_markup=main_menu(),
@@ -465,7 +464,7 @@ async def admin_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text=(
                     "🎉 *GREAT NEWS!*\n\n"
                     "Your Gmail account creation submission has been **APPROVED**! "
-                    "Your payment of **10 ETB** has been processed.\n\n"
+                    "Your payment of **10 ETB** has been sent to your account.\n\n"
                     "Thank you for working with MailPay 🇪🇹!"
                 ),
                 parse_mode="Markdown",
