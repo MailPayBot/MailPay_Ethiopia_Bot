@@ -19,7 +19,7 @@ WAITING_PAYMENT_METHOD, WAITING_PAYMENT_DETAILS, WAITING_RECEIPT_PHOTO = range(3
 
 # --- Admin Telegram Chat ID ---
 # Replace 123456789 with your actual Telegram numeric User ID!
-ADMIN_CHAT_ID = 123456789
+ADMIN_CHAT_ID = 982922116
 
 # --- Cooldown & Locked Slot Tracker for Rejected Users ---
 # Stores { user_id: {"ends_at": datetime, "slot_id": int} }
