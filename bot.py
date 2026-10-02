@@ -19,7 +19,10 @@ WAITING_PAYMENT_METHOD, WAITING_PAYMENT_DETAILS, WAITING_RECEIPT_PHOTO = range(3
 
 # --- Admin Telegram Chat ID ---
 # Replace 123456789 with your actual Telegram numeric User ID!
-ADMIN_CHAT_ID = 982922116
+ADMIN_CHAT_ID = 123456789
+
+# --- Thread Lock to Prevent Race Conditions ---
+SLOT_LOCK = threading.Lock()
 
 # --- Cooldown & Locked Slot Tracker for Rejected Users ---
 # Stores { user_id: {"ends_at": datetime, "slot_id": int} }
@@ -27,7 +30,7 @@ REJECTED_USER_LOCKS = {}
 REJECTION_COOLDOWN_MINUTES = 5
 
 # --- Completed Slots Tracker per User ---
-# Stores { user_id: set(slot_ids) } so approved slots are never given to the same user again
+# Stores { user_id: set(slot_ids) }
 USER_COMPLETED_SLOTS = {}
 
 # --- Render Port-Check Server ---
@@ -97,24 +100,16 @@ SLOTS = {
 SLOT_TIMEOUT_MINUTES = 20
 
 def release_expired_slots():
+    """Releases tasks that timed out without completion."""
     now = datetime.now()
     for slot_id, slot in SLOTS.items():
-        if slot["status"] == "REJECTED_LOCKED":
+        if slot["status"] in ("REJECTED_LOCKED", "COMPLETED"):
             continue
         if slot["status"] == "ASSIGNED" and slot["assigned_at"]:
             if now - slot["assigned_at"] > timedelta(minutes=SLOT_TIMEOUT_MINUTES):
                 slot["status"] = "AVAILABLE"
                 slot["assigned_to"] = None
                 slot["assigned_at"] = None
-
-
-def release_user_slot(user_id):
-    """Fully clears and releases a user's slot back to the public pool."""
-    for sid, slot in SLOTS.items():
-        if slot["assigned_to"] == user_id:
-            slot["status"] = "AVAILABLE"
-            slot["assigned_to"] = None
-            slot["assigned_at"] = None
 
 
 WELCOME = """👋 Welcome to MailPay 🇪🇹
@@ -298,57 +293,59 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = query.from_user.id
         now = datetime.now()
 
-        # 1. Check if user is in rejection cooldown
-        if user_id in REJECTED_USER_LOCKS:
-            lock_info = REJECTED_USER_LOCKS[user_id]
-            cooldown_ends = lock_info["ends_at"]
+        # Thread safety lock prevents multiple users grabbing the same slot simultaneously
+        with SLOT_LOCK:
+            # 1. Check if user is in rejection cooldown
+            if user_id in REJECTED_USER_LOCKS:
+                lock_info = REJECTED_USER_LOCKS[user_id]
+                cooldown_ends = lock_info["ends_at"]
 
-            if now < cooldown_ends:
-                remaining_secs = int((cooldown_ends - now).total_seconds())
-                rem_mins = (remaining_secs // 60) + 1
-                await query.edit_message_text(
-                    f"⏳ *REJECTION COOLDOWN IN PROGRESS*\n\n"
-                    f"Your previous submission was rejected.\n"
-                    f"Please wait **{rem_mins} minute(s)**. After the cooldown, you will be given the "
-                    f"**same Gmail account** to recreate and fix.",
-                    parse_mode="Markdown",
-                    reply_markup=back_main(),
-                )
-                return
+                if now < cooldown_ends:
+                    remaining_secs = int((cooldown_ends - now).total_seconds())
+                    rem_mins = (remaining_secs // 60) + 1
+                    await query.edit_message_text(
+                        f"⏳ *REJECTION COOLDOWN IN PROGRESS*\n\n"
+                        f"Your previous submission was rejected.\n"
+                        f"Please wait **{rem_mins} minute(s)**. After the cooldown, you will be given the "
+                        f"**same Gmail account** to recreate and fix.",
+                        parse_mode="Markdown",
+                        reply_markup=back_main(),
+                    )
+                    return
+                else:
+                    # Cooldown finished! Re-assign the exact same slot back to user
+                    assigned_slot_id = lock_info["slot_id"]
+                    SLOTS[assigned_slot_id]["status"] = "ASSIGNED"
+                    SLOTS[assigned_slot_id]["assigned_to"] = user_id
+                    SLOTS[assigned_slot_id]["assigned_at"] = now
+                    del REJECTED_USER_LOCKS[user_id]
+
             else:
-                # Cooldown is finished! Re-assign the exact same slot back to user
-                assigned_slot_id = lock_info["slot_id"]
-                SLOTS[assigned_slot_id]["status"] = "ASSIGNED"
-                SLOTS[assigned_slot_id]["assigned_to"] = user_id
-                SLOTS[assigned_slot_id]["assigned_at"] = now
-                del REJECTED_USER_LOCKS[user_id]
+                release_expired_slots()
+                assigned_slot_id = None
 
-        else:
-            release_expired_slots()
-            assigned_slot_id = None
-
-            # Check if user already has an active task in progress
-            for sid, slot in SLOTS.items():
-                if slot["assigned_to"] == user_id and slot["status"] == "ASSIGNED":
-                    assigned_slot_id = sid
-                    break
-
-            # If no active task, give them a NEW AVAILABLE slot they haven't completed yet
-            completed_set = USER_COMPLETED_SLOTS.get(user_id, set())
-
-            if not assigned_slot_id:
+                # Check if user already has an active task in progress
                 for sid, slot in SLOTS.items():
-                    if slot["status"] == "AVAILABLE" and sid not in completed_set:
-                        slot["status"] = "ASSIGNED"
-                        slot["assigned_to"] = user_id
-                        slot["assigned_at"] = now
+                    if slot["assigned_to"] == user_id and slot["status"] == "ASSIGNED":
                         assigned_slot_id = sid
                         break
 
+                # Assign next AVAILABLE slot that is NOT completed
+                completed_set = USER_COMPLETED_SLOTS.get(user_id, set())
+
+                if not assigned_slot_id:
+                    for sid, slot in SLOTS.items():
+                        if slot["status"] == "AVAILABLE" and sid not in completed_set:
+                            slot["status"] = "ASSIGNED"
+                            slot["assigned_to"] = user_id
+                            slot["assigned_at"] = now
+                            assigned_slot_id = sid
+                            break
+
         if not assigned_slot_id:
             await query.edit_message_text(
-                "⚠️ *No new Gmail tasks available for you right now!*\n\n"
-                "You have either completed all available tasks or all active tasks are assigned to other users. "
+                "⚠️ *No new Gmail tasks available right now!*\n\n"
+                "All tasks have either been completed or are currently in progress by other users. "
                 "Please check back later!",
                 parse_mode="Markdown",
                 reply_markup=back_main(),
@@ -449,10 +446,11 @@ async def receive_payment_details(update: Update, context: ContextTypes.DEFAULT_
 
     # Find user's assigned slot
     assigned_slot = None
-    for sid, slot in SLOTS.items():
-        if slot["assigned_to"] == user.id:
-            assigned_slot = slot
-            break
+    with SLOT_LOCK:
+        for sid, slot in SLOTS.items():
+            if slot["assigned_to"] == user.id:
+                assigned_slot = slot
+                break
 
     slot_email = assigned_slot["email"] if assigned_slot else "Unknown Email"
 
@@ -505,16 +503,16 @@ async def admin_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_user_id = int(parts[2])
 
     if action == "approve":
-        # Record completed slot for this user so they don't get assigned it again
-        for sid, slot in SLOTS.items():
-            if slot["assigned_to"] == target_user_id:
-                if target_user_id not in USER_COMPLETED_SLOTS:
-                    USER_COMPLETED_SLOTS[target_user_id] = set()
-                USER_COMPLETED_SLOTS[target_user_id].add(sid)
-                break
-
-        # Immediately release the user's slot
-        release_user_slot(target_user_id)
+        with SLOT_LOCK:
+            # Mark the slot COMPLETED so NO OTHER USER ever receives this email address
+            for sid, slot in SLOTS.items():
+                if slot["assigned_to"] == target_user_id:
+                    slot["status"] = "COMPLETED"
+                    slot["assigned_to"] = None
+                    if target_user_id not in USER_COMPLETED_SLOTS:
+                        USER_COMPLETED_SLOTS[target_user_id] = set()
+                    USER_COMPLETED_SLOTS[target_user_id].add(sid)
+                    break
 
         context.user_data["pending_receipt_user"] = target_user_id
         await query.edit_message_text(
@@ -526,28 +524,25 @@ async def admin_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAITING_RECEIPT_PHOTO
 
     elif action == "reject":
-        # Find which slot this user was working on
-        rejected_slot_id = None
-        for sid, slot in SLOTS.items():
-            if slot["assigned_to"] == target_user_id:
-                rejected_slot_id = sid
-                slot["status"] = "REJECTED_LOCKED"
-                break
+        with SLOT_LOCK:
+            rejected_slot_id = None
+            for sid, slot in SLOTS.items():
+                if slot["assigned_to"] == target_user_id:
+                    rejected_slot_id = sid
+                    slot["status"] = "REJECTED_LOCKED"
+                    break
 
-        # Set 5-minute cooldown timer & lock slot for this user
-        if rejected_slot_id:
-            REJECTED_USER_LOCKS[target_user_id] = {
-                "ends_at": datetime.now() + timedelta(minutes=REJECTION_COOLDOWN_MINUTES),
-                "slot_id": rejected_slot_id,
-            }
+            if rejected_slot_id:
+                REJECTED_USER_LOCKS[target_user_id] = {
+                    "ends_at": datetime.now() + timedelta(minutes=REJECTION_COOLDOWN_MINUTES),
+                    "slot_id": rejected_slot_id,
+                }
 
-        # Update admin chat message
         await query.edit_message_text(
             f"{query.message.text}\n\n❌ *STATUS: REJECTED*\n(User restricted for 5 minutes; slot locked for retry)",
             parse_mode="Markdown",
         )
 
-        # Notify the user
         try:
             await context.bot.send_message(
                 chat_id=target_user_id,
@@ -575,7 +570,6 @@ async def receive_admin_receipt(update: Update, context: ContextTypes.DEFAULT_TY
 
     photo_file_id = update.message.photo[-1].file_id
 
-    # Send receipt photo and approval message to user
     try:
         receipt_caption = (
             "🎉 *GREAT NEWS! PAYMENT SENT!*\n\n"
@@ -611,7 +605,6 @@ if __name__ == "__main__":
 
     app = Application.builder().token(TOKEN).build()
 
-    # User Submission Flow
     user_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(start_submission, pattern="^account_created$")],
         states={
@@ -621,7 +614,6 @@ if __name__ == "__main__":
         fallbacks=[],
     )
 
-    # Admin Approval & Photo Receipt Upload Flow
     admin_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_decision, pattern="^adm_")],
         states={
