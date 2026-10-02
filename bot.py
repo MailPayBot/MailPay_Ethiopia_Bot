@@ -1,7 +1,6 @@
 import os
 import logging
 from datetime import datetime, timedelta
-from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -18,16 +17,17 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 
-# --- LOAD ENVIRONMENT VARIABLES ---
-load_dotenv()
+# --- READ ENVIRONMENT VARIABLES DIRECTLY FROM RENDER ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
+
+# Cleanly parse ADMIN_CHAT_ID avoiding string conversion errors
+raw_admin_id = os.getenv("ADMIN_CHAT_ID", "982922116").strip().replace('"', '').replace("'", "")
+ADMIN_CHAT_ID = int(raw_admin_id)
 
 # --- CONVERSATION STATES ---
 AWAITING_EMAIL_INFO, AWAITING_PAYMENT_INFO = range(2)
 
 # --- IN-MEMORY DATABASE & SLOTS (3-Slot Buffer) ---
-# Update the 'info' strings below with the exact Gmail formatting instructions provided by your buyers/agencies
 SLOTS = {
     1: {
         "provider": "Agency Slot 1",
