@@ -19,7 +19,12 @@ WAITING_PAYMENT_METHOD, WAITING_PAYMENT_DETAILS, WAITING_RECEIPT_PHOTO = range(3
 
 # --- Admin Telegram Chat ID ---
 # Replace 123456789 with your actual Telegram numeric User ID!
-ADMIN_CHAT_ID = 982922116
+ADMIN_CHAT_ID = 123456789
+
+# --- Cooldown & Locked Slot Tracker for Rejected Users ---
+# Stores { user_id: {"ends_at": datetime, "slot_id": int} }
+REJECTED_USER_LOCKS = {}
+REJECTION_COOLDOWN_MINUTES = 5
 
 # --- Render Port-Check Server ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -90,11 +95,23 @@ SLOT_TIMEOUT_MINUTES = 20
 def release_expired_slots():
     now = datetime.now()
     for slot_id, slot in SLOTS.items():
+        # Do not expire slots locked for rejected users awaiting retry
+        if slot["status"] == "REJECTED_LOCKED":
+            continue
         if slot["status"] == "ASSIGNED" and slot["assigned_at"]:
             if now - slot["assigned_at"] > timedelta(minutes=SLOT_TIMEOUT_MINUTES):
                 slot["status"] = "AVAILABLE"
                 slot["assigned_to"] = None
                 slot["assigned_at"] = None
+
+
+def release_user_slot(user_id):
+    """Fully clears and releases a user's slot back to the public pool."""
+    for sid, slot in SLOTS.items():
+        if slot["assigned_to"] == user_id:
+            slot["status"] = "AVAILABLE"
+            slot["assigned_to"] = None
+            slot["assigned_at"] = None
 
 
 WELCOME = """👋 Welcome to MailPay 🇪🇹
@@ -245,6 +262,7 @@ def faq_menu():
         [InlineKeyboardButton("💰 How much do I earn?", callback_data="faq_earn")],
         [InlineKeyboardButton("⏱ When will I get paid?", callback_data="faq_paid")],
         [InlineKeyboardButton("📨 How do I submit an account?", callback_data="faq_submit")],
+        [InlineKeyboardButton("📨 How do I submit an account?", callback_data="faq_submit")],
         [InlineKeyboardButton("📱 How to remove / log out account?", callback_data="faq_remove")],
         [InlineKeyboardButton("❌ What if my submission isn't verified?", callback_data="faq_rejected")],
         [InlineKeyboardButton("🔢 Can I submit multiple accounts?", callback_data="faq_multiple")],
@@ -275,28 +293,57 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(WELCOME, reply_markup=main_menu())
 
     elif data == "get_task":
-        release_expired_slots()
         user_id = query.from_user.id
-        assigned_slot_id = None
+        now = datetime.now()
 
-        for sid, slot in SLOTS.items():
-            if slot["assigned_to"] == user_id and slot["status"] == "ASSIGNED":
-                assigned_slot_id = sid
-                break
+        # 1. Check if user is in rejection cooldown
+        if user_id in REJECTED_USER_LOCKS:
+            lock_info = REJECTED_USER_LOCKS[user_id]
+            cooldown_ends = lock_info["ends_at"]
 
-        if not assigned_slot_id:
+            if now < cooldown_ends:
+                remaining_secs = int((cooldown_ends - now).total_seconds())
+                rem_mins = (remaining_secs // 60) + 1
+                await query.edit_message_text(
+                    f"⏳ *REJECTION COOLDOWN IN PROGRESS*\n\n"
+                    f"Your previous submission was rejected.\n"
+                    f"Please wait **{rem_mins} minute(s)**. After the cooldown, you will be given the "
+                    f"**same Gmail account** to recreate and fix.",
+                    parse_mode="Markdown",
+                    reply_markup=back_main(),
+                )
+                return
+            else:
+                # Cooldown is finished! Re-assign the exact same slot back to user
+                assigned_slot_id = lock_info["slot_id"]
+                SLOTS[assigned_slot_id]["status"] = "ASSIGNED"
+                SLOTS[assigned_slot_id]["assigned_at"] = now
+                del REJECTED_USER_LOCKS[user_id]
+
+        else:
+            release_expired_slots()
+            assigned_slot_id = None
+
+            # Check if user already has an active task in progress
             for sid, slot in SLOTS.items():
-                if slot["status"] == "AVAILABLE":
-                    slot["status"] = "ASSIGNED"
-                    slot["assigned_to"] = user_id
-                    slot["assigned_at"] = datetime.now()
+                if slot["assigned_to"] == user_id and slot["status"] == "ASSIGNED":
                     assigned_slot_id = sid
                     break
 
+            # If no active task, give them a NEW AVAILABLE slot
+            if not assigned_slot_id:
+                for sid, slot in SLOTS.items():
+                    if slot["status"] == "AVAILABLE":
+                        slot["status"] = "ASSIGNED"
+                        slot["assigned_to"] = user_id
+                        slot["assigned_at"] = now
+                        assigned_slot_id = sid
+                        break
+
         if not assigned_slot_id:
             await query.edit_message_text(
-                "⚠️ *All available account tasks are currently in use!*\n\n"
-                "Please check back in 15–20 minutes once a task frees up.",
+                "⚠️ *All available Gmail tasks are currently in use by other users!*\n\n"
+                "Please check back in 15–20 minutes once a task is completed or freed up.",
                 parse_mode="Markdown",
                 reply_markup=back_main(),
             )
@@ -462,19 +509,38 @@ async def admin_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAITING_RECEIPT_PHOTO
 
     elif action == "reject":
-        # Update admin message
+        # Find which slot this user was working on
+        rejected_slot_id = None
+        for sid, slot in SLOTS.items():
+            if slot["assigned_to"] == target_user_id:
+                rejected_slot_id = sid
+                # Lock slot specifically for this user so nobody else can take it
+                slot["status"] = "REJECTED_LOCKED"
+                break
+
+        # Set 5-minute cooldown timer & lock slot for this user
+        if rejected_slot_id:
+            REJECTED_USER_LOCKS[target_user_id] = {
+                "ends_at": datetime.now() + timedelta(minutes=REJECTION_COOLDOWN_MINUTES),
+                "slot_id": rejected_slot_id,
+            }
+
+        # Update admin chat message
         await query.edit_message_text(
-            f"{query.message.text}\n\n❌ *STATUS: REJECTED*",
+            f"{query.message.text}\n\n❌ *STATUS: REJECTED*\n(User restricted for 5 minutes; slot locked for retry)",
             parse_mode="Markdown",
         )
-        # Send rejection message to user
+
+        # Notify the user
         try:
             await context.bot.send_message(
                 chat_id=target_user_id,
                 text=(
-                    "❌ *SUBMISSION UPDATE*\n\n"
-                    "Your Gmail account creation submission was **NOT VERIFIED** or did not meet the requirements.\n\n"
-                    "If you believe this is an error, please contact support: " + SUPPORT_USERNAME
+                    "❌ *SUBMISSION REJECTED*\n\n"
+                    "Your Gmail submission was not verified.\n\n"
+                    "⏳ **Rule:** You are restricted for 5 minutes. After 5 minutes, tap '➕ Get Gmail Task' "
+                    "to recreate and fix **this same account**.\n\n"
+                    "If you need help, contact support: " + SUPPORT_USERNAME
                 ),
                 parse_mode="Markdown",
             )
@@ -493,13 +559,14 @@ async def receive_admin_receipt(update: Update, context: ContextTypes.DEFAULT_TY
 
     photo_file_id = update.message.photo[-1].file_id
 
-    # Forward photo receipt & payment approval text to user
+    # Send receipt photo and approval message to user
     try:
         receipt_caption = (
             "🎉 *GREAT NEWS! PAYMENT SENT!*\n\n"
             "Your Gmail account creation submission has been **APPROVED**! "
             "Your payment of **10 ETB** has been transferred.\n\n"
             "📄 Attached above is your official payment transfer receipt.\n\n"
+            "You can now tap '➕ Get Gmail Task' to receive a NEW account task!\n\n"
             "Thank you for working with MailPay 🇪🇹!"
         )
         await context.bot.send_photo(
@@ -514,6 +581,9 @@ async def receive_admin_receipt(update: Update, context: ContextTypes.DEFAULT_TY
         )
     except Exception as e:
         await update.message.reply_text(f"❌ Failed to deliver receipt to user: {e}")
+
+    # ON APPROVAL: Fully release the slot so the user (or someone else) gets a DIFFERENT one next
+    release_user_slot(target_user_id)
 
     context.user_data.pop("pending_receipt_user", None)
     return ConversationHandler.END
