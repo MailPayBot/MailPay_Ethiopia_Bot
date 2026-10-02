@@ -13,6 +13,27 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+# State definition for admin receipt upload
+WAITING_RECEIPT_PHOTO = 3
+
+async def admin_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    parts = data.split("_")
+    action = parts[1]
+    target_user_id = int(parts[2])
+
+    if action == "approve":
+        # Save the target user ID in context and ask admin for the receipt image
+        context.user_data["pending_receipt_user"] = target_user_id
+        await query.edit_message_text(
+            f"{query.message.text}\n\n⏳ *STATUS: AWAITING RECEIPT PHOTO*\n"
+            "Please send/upload the transaction screenshot now to deliver it to the user.",
+            parse_mode="Markdown"
+        )
+        return WAITING_RECEIPT_PHOTO
 
 # --- Conversation States ---
 WAITING_PAYMENT_METHOD, WAITING_PAYMENT_DETAILS = range(2)
