@@ -14,10 +14,10 @@ from telegram.ext import (
 )
 
 # --- Conversation States ---
-WAITING_SCREENSHOT, WAITING_PAYMENT_METHOD, WAITING_PAYMENT_DETAILS, WAITING_RECEIPT_PHOTO = range(4)
+WAITING_SCREENSHOT, WAITING_PAYMENT_DETAILS, WAITING_RECEIPT_PHOTO = range(3)
 
 # --- Admin Telegram Configuration ---
-# ⚠️ IMPORTANT: Replace 123456789 with your actual numeric Telegram User ID!
+# ⚠️ Replace 123456789 with your numeric Telegram User ID!
 ADMIN_CHAT_ID = 982922116
 SUPPORT_USERNAME = "@CHUNKLA47"
 SUPPORT_URL = "https://t.me/CHUNKLA47"
@@ -288,8 +288,6 @@ async def admin_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             print(f"Failed to notify user {target_user_id}: {e}")
 
-        return ConversationHandler.END
-
     elif action == "reject":
         await query.edit_message_caption(
             caption=f"{query.message.caption}\n\n❌ *STATUS: REJECTED*",
@@ -308,8 +306,6 @@ async def admin_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as e:
             print(f"Failed to notify user {target_user_id}: {e}")
-
-        return ConversationHandler.END
 
 # --- Payment Collection Flow ---
 async def select_payment_method(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -339,12 +335,16 @@ async def receive_payment_details(update: Update, context: ContextTypes.DEFAULT_
                 f"👤 **User:** @{user.username or 'No Username'} (ID: `{user.id}`)\n"
                 f"🏦 **Method:** {method}\n"
                 f"🔢 **Details:** `{user_details}`\n\n"
-                f"📸 **Next Step:** Reply to this user with their payout receipt photo once transferred."
+                f"📸 **Next Step:** Tap the button below to send the payout receipt photo once transferred."
             )
+            receipt_btn = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📸 Send Payment Receipt", callback_data=f"adm_receipt_{user.id}")]
+            ])
             await context.bot.send_message(
                 chat_id=ADMIN_CHAT_ID,
                 text=admin_msg,
                 parse_mode="Markdown",
+                reply_markup=receipt_btn,
             )
         except Exception as e:
             print(f"Failed to send payment details to admin: {e}")
@@ -359,11 +359,26 @@ async def receive_payment_details(update: Update, context: ContextTypes.DEFAULT_
     return ConversationHandler.END
 
 # --- Admin Receipt Delivery Flow ---
+async def start_receipt_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    parts = query.data.split("_")
+    target_user_id = int(parts[2])
+    context.user_data["pending_receipt_user"] = target_user_id
+
+    await query.edit_message_text(
+        f"📸 *SEND PAYMENT RECEIPT*\n\n"
+        f"Please upload/send the transfer receipt photo now for User ID: `{target_user_id}`.",
+        parse_mode="Markdown",
+    )
+    return WAITING_RECEIPT_PHOTO
+
 async def receive_admin_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_user_id = context.user_data.get("pending_receipt_user")
 
     if not target_user_id:
-        await update.message.reply_text("⚠️ No user session found to attach this receipt to.")
+        await update.message.reply_text("⚠️ No user session found to send this receipt to.")
         return ConversationHandler.END
 
     photo_file_id = update.message.photo[-1].file_id
@@ -382,7 +397,7 @@ async def receive_admin_receipt(update: Update, context: ContextTypes.DEFAULT_TY
             parse_mode="Markdown",
         )
         await update.message.reply_text(
-            f"✅ *Receipt successfully sent to user (ID: `{target_user_id}`)!*",
+            f"✅ *Receipt successfully delivered to user (ID: `{target_user_id}`)!*",
             parse_mode="Markdown",
         )
     except Exception as e:
@@ -413,8 +428,8 @@ if __name__ == "__main__":
         fallbacks=[],
     )
 
-    admin_receipt_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_decision, pattern="^adm_")],
+    receipt_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_receipt_upload, pattern="^adm_receipt_")],
         states={
             WAITING_RECEIPT_PHOTO: [MessageHandler(filters.PHOTO, receive_admin_receipt)],
         },
@@ -423,10 +438,11 @@ if __name__ == "__main__":
 
     app.add_handler(screenshot_conv)
     app.add_handler(payment_conv)
-    app.add_handler(admin_receipt_conv)
+    app.add_handler(receipt_conv)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CallbackQueryHandler(admin_decision, pattern="^adm_approve_|^adm_reject_"))
     app.add_handler(CallbackQueryHandler(buttons))
 
     print("MailPay Ethiopia proxy bot is running...")
