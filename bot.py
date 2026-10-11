@@ -17,12 +17,12 @@ from telegram.ext import (
 WAITING_SCREENSHOT, WAITING_PAYMENT_DETAILS, WAITING_RECEIPT_PHOTO = range(3)
 
 # --- Admin Telegram Configuration ---
-# ⚠️️ Replace 123456789 with your actual numeric Telegram User ID!
-ADMIN_CHAT_ID = 123456789
+# --- Admin Telegram User ID ---
+ADMIN_CHAT_ID = 982922116
 SUPPORT_USERNAME = "@CHUNKLA47"
 SUPPORT_URL = "https://t.me/CHUNKLA47"
 CHANNEL_URL = "https://t.me/MailPayEt"
-WEBSITE_URL = "https://mailpayet.github.io/daneildays-gmail.com/"
+WEBSITE_URL = "https://mailpayet.github.io/MailPayET/"
 
 # --- User Language Storage ---
 # Stores { user_id: "en" | "am" }
@@ -243,6 +243,10 @@ def main_menu(lang="en"):
             InlineKeyboardButton(t["btn_channel"], url=CHANNEL_URL),
             InlineKeyboardButton(t["btn_web"], url=WEBSITE_URL),
         ],
+        [InlineKeyboardButton("ⓕ Facebook", url="https://web.facebook.com/share/p/1MN18PyRa2/")],
+        [InlineKeyboardButton("📸 Instagram", url="https://www.instagram.com/reel/DeFXtuQlZjo/?utm_source=ig_web_copy_link&stkn=MzRlODBiNWFlZA==")],
+        [InlineKeyboardButton("🟢 WhatsApp", url="https://wa.me/message/4AGHRHT64MI4K1")],
+        [InlineKeyboardButton("♪ TikTok", url="https://vm.tiktok.com/ZS9Aveo3qnhSJ-gMcyh/")],
         [InlineKeyboardButton(t["btn_lang"], callback_data="toggle_language")],
         [InlineKeyboardButton(t["btn_support"], callback_data="support")],
     ])
