@@ -1,8 +1,9 @@
+import html
 import os
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -57,6 +58,7 @@ if not TOKEN:
     raise ValueError("Error: BOT_TOKEN is missing. Please check your environment variables.")
 
 # --- Multilingual Text Content ---
+# NOTE: messages sent with parse_mode="Markdown" use *single stars* for bold.
 TEXTS = {
     "en": {
         "welcome": "👋 Welcome to MailPay 🇪🇹\n\nLooking for a simple way to earn?\n\nWe provide the information you need to participate in our Gmail account service.\n\nChoose an option below 👇",
@@ -112,13 +114,15 @@ TEXTS = {
             "4. Select the account to remove\n"
             "5. Click Remove Account below the selected account"
         ),
-        "prompt_screenshot": "📸 *SUBMIT ACCOUNT SCREENSHOT*\n\nPlease upload a photo/screenshot showing the Gmail account you created.",
+        "prompt_screenshot": "📸 *SUBMIT ACCOUNT SCREENSHOT*\n\nPlease upload a photo/screenshot showing the Gmail account you created.\n\n(Send /cancel to go back.)",
+        "screenshot_wrong_input": "⚠️ Please send a *photo/screenshot* of the Gmail account you created.\n\nSend /cancel to go back to the menu.",
         "screenshot_received": "✅ *Screenshot received successfully!*\n\nYour submission is now under review by the Admin. You will receive a notification here once verified.",
-        "approved_msg": "🎉 *ACCOUNT APPROVED!*\n\nYou have successfully created the account based on the provided details! You will receive **10 ETB** within 3 days.\n\n💳 Please select your payment method below:",
+        "approved_msg": "🎉 *ACCOUNT APPROVED!*\n\nYou have successfully created the account based on the provided details! You will receive *10 ETB* within 3 days.\n\n💳 Please select your payment method below:",
         "rejected_msg": "❌ *SUBMISSION REJECTED*\n\nYou haven't created the account based on the provided information.\n\nPlease contact Admin if you need help or try creating the account correctly.",
-        "prompt_payment": "📱 *ENTER YOUR {method} DETAILS*\n\nPlease reply to this message with your phone number or account number for **{method}**:",
+        "prompt_payment": "📱 *ENTER YOUR {method} DETAILS*\n\nPlease reply to this message with your phone number or account number for *{method}*:",
         "payment_received": "🎉 *Payment details submitted!*\n\nYour payment is being processed. A payment receipt will be sent directly to this chat once the transfer is complete.\n\nThank you for participating with MailPay 🇪🇹!",
-        "receipt_delivered": "🎉 *GREAT NEWS! PAYMENT SENT!*\n\nYour payment of **10 ETB** has been transferred.\n\n📄 Attached above is your official payment transfer receipt.\n\nThank you for working with MailPay 🇪🇹!",
+        "receipt_delivered": "🎉 *GREAT NEWS! PAYMENT SENT!*\n\nYour payment of *10 ETB* has been transferred.\n\n📄 Attached above is your official payment transfer receipt.\n\nThank you for working with MailPay 🇪🇹!",
+        "cancelled": "✅ Cancelled. Back to the main menu 👇",
         "btn_get_task": "➕ Get Gmail Task",
         "btn_submit_ss": "📸 Submit Screenshot",
         "btn_how": "📚 How It Works",
@@ -186,13 +190,15 @@ TEXTS = {
             "4. ማጥፋት የሚፈልጉትን አካውንት ይምረጡ\n"
             "5. Remove Account የሚለውን ይጫኑ"
         ),
-        "prompt_screenshot": "📸 *የአካውንት ስክሪንሾት (Screenshot) ይላኩ*\n\nእባክዎ የከፈቱትን የጂሜይል አካውንት የሚያሳይ ፎቶ/ስክሪንሾት እዚህ ይላኩ።",
+        "prompt_screenshot": "📸 *የአካውንት ስክሪንሾት (Screenshot) ይላኩ*\n\nእባክዎ የከፈቱትን የጂሜይል አካውንት የሚያሳይ ፎቶ/ስክሪንሾት እዚህ ይላኩ።\n\n(ለመመለስ /cancel ይላኩ።)",
+        "screenshot_wrong_input": "⚠️ እባክዎ የከፈቱትን የጂሜይል አካውንት የሚያሳይ *ፎቶ/ስክሪንሾት* ይላኩ።\n\nወደ ዋና ማውጫ ለመመለስ /cancel ይላኩ።",
         "screenshot_received": "✅ *ስክሪንሾቱ በተሳካ ሁኔታ ደርሷል!*\n\nመረጃዎ አሁን በAdmin እየተገመገመ ነው። ሲረጋገጥ እዚህ መልእክት ይደርስዎታል።",
-        "approved_msg": "🎉 *አካውንቱ ተፀድቋል!*\n\nበተሰጠው መረጃ መሰረት አካውንቱን በተሳካ ሁኔታ ፈጥረዋል! በ3 ቀናት ውስጥ **10 ETB** ይደርስዎታል።\n\n💳 እባክዎ ከታች የክፍያ የተቀባይነት አማራጭዎን ይምረጡ:",
+        "approved_msg": "🎉 *አካውንቱ ተፀድቋል!*\n\nበተሰጠው መረጃ መሰረት አካውንቱን በተሳካ ሁኔታ ፈጥረዋል! በ3 ቀናት ውስጥ *10 ETB* ይደርስዎታል።\n\n💳 እባክዎ ከታች የክፍያ የተቀባይነት አማራጭዎን ይምረጡ:",
         "rejected_msg": "❌ *አካውንቱ አልተቀበለም*\n\nበተሰጠው መረጃ መሰረት አካውንቱን አልፈጠሩም።\n\nእባክዎ እርዳታ ካስፈለገዎት Adminን ያናግሩ ወይም እንደገና በትክክል ይክፈቱ።",
-        "prompt_payment": "📱 *የ{method} መረጃዎን ያስገቡ*\n\nእባክዎ ለ**{method}** የሚሆን የስልክ ቁጥር ወይም የባንክ ሂሳብ ቁጥር ይላኩ:",
+        "prompt_payment": "📱 *የ{method} መረጃዎን ያስገቡ*\n\nእባክዎ ለ*{method}* የሚሆን የስልክ ቁጥር ወይም የባንክ ሂሳብ ቁጥር ይላኩ:",
         "payment_received": "🎉 *የክፍያ መረጃዎ ደርሷል!*\n\nክፍያዎ በመሰራት ላይ ነው። ክፍያው እንደተጠናቀቀ የክፍያ ደረሰኝ በቀጥታ እዚህ ይላክልዎታል።\n\nከ MailPay 🇪🇹 ጋር ስለሰሩ እናመሰግናለን!",
-        "receipt_delivered": "🎉 *መልካም ዜና! ክፍያዎ ተላከ!*\n\nየ **10 ETB** ክፍያዎ ተላክል።\n\n📄 ይፋዊ የክፍያ ደረሰኝዎ ከላይ ተያይዟል።\n\nከ MailPay 🇪🇹 ጋር ስለሰሩ እናመሰግናለን!",
+        "receipt_delivered": "🎉 *መልካም ዜና! ክፍያዎ ተላከ!*\n\nየ *10 ETB* ክፍያዎ ተላክል።\n\n📄 ይፋዊ የክፍያ ደረሰኝዎ ከላይ ተያይዟል።\n\nከ MailPay 🇪🇹 ጋር ስለሰሩ እናመሰግናለን!",
+        "cancelled": "✅ ተሰርዟል። ወደ ዋና ማውጫ ተመልሰዋል 👇",
         "btn_get_task": "➕ Get Gmail Task / ስራ አግኝ",
         "btn_submit_ss": "📸 Submit Screenshot / ስክሪንሾት ላክ",
         "btn_how": "📚 How It Works / እንዴት እንደሚሰራ",
@@ -257,6 +263,11 @@ def back_main(lang="en"):
         [InlineKeyboardButton(t["btn_back"], callback_data="main_menu")]
     ])
 
+def faq_heading(lang="en"):
+    if lang == "en":
+        return "❓ FREQUENTLY ASKED QUESTIONS\n\nChoose a question below 👇"
+    return "❓ ተደጋግመው የሚጠየቁ ጥያቄዎች\n\nከታች ይምረጡ 👇"
+
 def faq_menu(lang="en"):
     is_am = lang == "am"
     return InlineKeyboardMarkup([
@@ -275,19 +286,83 @@ def faq_back(lang="en"):
         [InlineKeyboardButton("🏠 Main Menu" if not is_am else "🏠 ዋና ማውጫ", callback_data="main_menu")],
     ])
 
+def task_keyboard(lang, user_id):
+    t = TEXTS[lang]
+    dm_url = f"https://t.me/CHUNKLA47?text=Hi%20Admin,%20I%20want%20to%20create%20a%20Gmail%20account!%20My%20User%20ID:%20{user_id}"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(t["btn_contact_admin"], url=dm_url)],
+        [InlineKeyboardButton(t["btn_submit_ss"], callback_data="start_submit_screenshot")],
+        [InlineKeyboardButton(t["btn_back"], callback_data="main_menu")],
+    ])
+
+def support_content(lang):
+    t = TEXTS[lang]
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💬 Contact Support Admin", url=SUPPORT_URL)],
+        [InlineKeyboardButton("📢 Official Channel", url=CHANNEL_URL)],
+        [InlineKeyboardButton(t["btn_back"], callback_data="main_menu")],
+    ])
+    if lang == "en":
+        text = f"👤 CONTACT SUPPORT\n\nNeed help?\nContact support: {SUPPORT_USERNAME}\nChannel: {CHANNEL_URL}"
+    else:
+        text = f"👤 እገዛ ለማግኘት\n\nእርዳታ ይፈልጋሉ?\nAdminን ያናግሩ: {SUPPORT_USERNAME}\nቻናል: {CHANNEL_URL}"
+    return text, keyboard
+
 # --- Core Command Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
+    user_id = update.effective_user.id
     lang = get_lang(user_id)
     await update.message.reply_text(TEXTS[lang]["welcome"], reply_markup=main_menu(lang))
 
 async def set_language_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
+    user_id = update.effective_user.id
     current_lang = get_lang(user_id)
     new_lang = "am" if current_lang == "en" else "en"
     USER_LANG[user_id] = new_lang
     msg = "🌐 Language changed to English!" if new_lang == "en" else "🌐 ቋንቋ ወደ አማርኛ ተቀይሯል!"
     await update.message.reply_text(msg, reply_markup=main_menu(new_lang))
+
+# --- Typed Slash Commands (/howitworks, /payment, /requirements, ...) ---
+def make_text_command(text_key):
+    """Builds a command handler that replies with TEXTS[lang][text_key]."""
+    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        lang = get_lang(update.effective_user.id)
+        await update.message.reply_text(TEXTS[lang][text_key], reply_markup=back_main(lang))
+    return handler
+
+cmd_how = make_text_command("how_it_works")
+cmd_payment = make_text_command("payment_info")
+cmd_requirements = make_text_command("requirements")
+
+async def cmd_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    lang = get_lang(user_id)
+    await update.message.reply_text(
+        TEXTS[lang]["task_info"],
+        parse_mode="Markdown",
+        reply_markup=task_keyboard(lang, user_id),
+    )
+
+async def cmd_faq(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(update.effective_user.id)
+    await update.message.reply_text(faq_heading(lang), reply_markup=faq_menu(lang))
+
+async def cmd_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(update.effective_user.id)
+    text, keyboard = support_content(lang)
+    await update.message.reply_text(text, reply_markup=keyboard)
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/cancel - leaves any screenshot / payment / receipt step and shows the menu."""
+    lang = get_lang(update.effective_user.id)
+    context.user_data.pop("pending_receipt_user", None)
+    await update.message.reply_text(TEXTS[lang]["cancelled"], reply_markup=main_menu(lang))
+    return ConversationHandler.END
+
+async def start_and_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/start while inside a conversation step - reset and show the menu."""
+    await start(update, context)
+    return ConversationHandler.END
 
 # --- Menu Callback Handler ---
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -308,14 +383,11 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(new_t["welcome"], reply_markup=main_menu(new_lang))
 
     elif data == "get_task":
-        dm_url = f"https://t.me/CHUNKLA47?text=Hi%20Admin,%20I%20want%20to%20create%20a%20Gmail%20account!%20My%20User%20ID:%20{user_id}"
-        
-        task_keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton(t["btn_contact_admin"], url=dm_url)],
-            [InlineKeyboardButton(t["btn_submit_ss"], callback_data="start_submit_screenshot")],
-            [InlineKeyboardButton(t["btn_back"], callback_data="main_menu")],
-        ])
-        await query.edit_message_text(t["task_info"], parse_mode="Markdown", reply_markup=task_keyboard)
+        await query.edit_message_text(
+            t["task_info"],
+            parse_mode="Markdown",
+            reply_markup=task_keyboard(lang, user_id),
+        )
 
     elif data == "how_it_works":
         await query.edit_message_text(t["how_it_works"], reply_markup=back_main(lang))
@@ -327,29 +399,32 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(t["requirements"], reply_markup=back_main(lang))
 
     elif data == "faq":
-        heading = "❓ FREQUENTLY ASKED QUESTIONS\n\nChoose a question below 👇" if lang == "en" else "❓ ተደጋግመው የሚጠየቁ ጥያቄዎች\n\nከታች ይምረጡ 👇"
-        await query.edit_message_text(heading, reply_markup=faq_menu(lang))
+        await query.edit_message_text(faq_heading(lang), reply_markup=faq_menu(lang))
 
     elif data in FAQ_ANSWERS[lang]:
         await query.edit_message_text(FAQ_ANSWERS[lang][data], reply_markup=faq_back(lang))
 
     elif data == "support":
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("💬 Contact Support Admin", url=SUPPORT_URL)],
-            [InlineKeyboardButton("📢 Official Channel", url=CHANNEL_URL)],
-            [InlineKeyboardButton(t["btn_back"], callback_data="main_menu")],
-        ])
-        supp_text = f"👤 CONTACT SUPPORT\n\nNeed help?\nContact support: {SUPPORT_USERNAME}\nChannel: {CHANNEL_URL}" if lang == "en" else f"👤 እገዛ ለማግኘት\n\nእርዳታ ይፈልጋሉ?\nAdminን ያናግሩ: {SUPPORT_USERNAME}\nቻናል: {CHANNEL_URL}"
-        await query.edit_message_text(supp_text, reply_markup=keyboard)
+        text, keyboard = support_content(lang)
+        await query.edit_message_text(text, reply_markup=keyboard)
 
 # --- Screenshot Submission Flow ---
 async def start_screenshot_submission(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
+    """Works both from the inline button and from the /submit command."""
+    user_id = update.effective_user.id
     lang = get_lang(user_id)
 
-    await query.edit_message_text(TEXTS[lang]["prompt_screenshot"], parse_mode="Markdown")
+    if update.callback_query:
+        query = update.callback_query
+        await query.answer()
+        await query.edit_message_text(TEXTS[lang]["prompt_screenshot"], parse_mode="Markdown")
+    else:
+        await update.message.reply_text(TEXTS[lang]["prompt_screenshot"], parse_mode="Markdown")
+    return WAITING_SCREENSHOT
+
+async def screenshot_wrong_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(update.effective_user.id)
+    await update.message.reply_text(TEXTS[lang]["screenshot_wrong_input"], parse_mode="Markdown")
     return WAITING_SCREENSHOT
 
 async def receive_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -359,10 +434,12 @@ async def receive_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if ADMIN_CHAT_ID:
         try:
+            # HTML mode so usernames containing "_" can't break the message
+            username = html.escape(user.username) if user.username else "No Username"
             admin_caption = (
-                f"🚨 *NEW SCREENSHOT SUBMISSION*\n\n"
-                f"👤 **User:** @{user.username or 'No Username'} (ID: `{user.id}`)\n"
-                f"🌐 **Preferred Lang:** {lang.upper()}\n"
+                f"🚨 <b>NEW SCREENSHOT SUBMISSION</b>\n\n"
+                f"👤 <b>User:</b> @{username} (ID: <code>{user.id}</code>)\n"
+                f"🌐 <b>Preferred Lang:</b> {lang.upper()}\n"
                 f"Is this the correct Gmail account based on the provided info?"
             )
             admin_keyboard = InlineKeyboardMarkup([
@@ -375,7 +452,7 @@ async def receive_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 chat_id=ADMIN_CHAT_ID,
                 photo=photo_id,
                 caption=admin_caption,
-                parse_mode="Markdown",
+                parse_mode="HTML",
                 reply_markup=admin_keyboard,
             )
         except Exception as e:
@@ -398,10 +475,12 @@ async def admin_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_user_id = int(parts[2])
     target_lang = get_lang(target_user_id)
 
+    original_caption = query.message.caption_html or ""
+
     if action == "approve":
         await query.edit_message_caption(
-            caption=f"{query.message.caption}\n\n✅ *STATUS: APPROVED*\nUser notified to enter payment details.",
-            parse_mode="Markdown",
+            caption=f"{original_caption}\n\n✅ <b>STATUS: APPROVED</b>\nUser notified to enter payment details.",
+            parse_mode="HTML",
         )
 
         method_keyboard = InlineKeyboardMarkup([
@@ -422,8 +501,8 @@ async def admin_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action == "reject":
         await query.edit_message_caption(
-            caption=f"{query.message.caption}\n\n❌ *STATUS: REJECTED*",
-            parse_mode="Markdown",
+            caption=f"{original_caption}\n\n❌ <b>STATUS: REJECTED</b>",
+            parse_mode="HTML",
         )
 
         try:
@@ -461,12 +540,13 @@ async def receive_payment_details(update: Update, context: ContextTypes.DEFAULT_
 
     if ADMIN_CHAT_ID:
         try:
+            username = html.escape(user.username) if user.username else "No Username"
             admin_msg = (
-                f"💳 *PAYMENT DETAILS SUBMITTED*\n\n"
-                f"👤 **User:** @{user.username or 'No Username'} (ID: `{user.id}`)\n"
-                f"🏦 **Method:** {method}\n"
-                f"🔢 **Details:** `{user_details}`\n\n"
-                f"📸 **Next Step:** Tap the button below to send the payout receipt photo once transferred."
+                f"💳 <b>PAYMENT DETAILS SUBMITTED</b>\n\n"
+                f"👤 <b>User:</b> @{username} (ID: <code>{user.id}</code>)\n"
+                f"🏦 <b>Method:</b> {html.escape(method)}\n"
+                f"🔢 <b>Details:</b> <code>{html.escape(user_details)}</code>\n\n"
+                f"📸 <b>Next Step:</b> Tap the button below to send the payout receipt photo once transferred."
             )
             receipt_btn = InlineKeyboardMarkup([
                 [InlineKeyboardButton("📸 Send Payment Receipt", callback_data=f"adm_receipt_{user.id}")]
@@ -474,7 +554,7 @@ async def receive_payment_details(update: Update, context: ContextTypes.DEFAULT_
             await context.bot.send_message(
                 chat_id=ADMIN_CHAT_ID,
                 text=admin_msg,
-                parse_mode="Markdown",
+                parse_mode="HTML",
                 reply_markup=receipt_btn,
             )
         except Exception as e:
@@ -529,18 +609,51 @@ async def receive_admin_receipt(update: Update, context: ContextTypes.DEFAULT_TY
     context.user_data.pop("pending_receipt_user", None)
     return ConversationHandler.END
 
+# --- Error Handler (so problems show up in your logs instead of failing silently) ---
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    print(f"Error while handling an update: {context.error}")
+
+# --- Telegram "/" command menu ---
+async def post_init(application: Application):
+    await application.bot.set_my_commands([
+        BotCommand("start", "Open the main menu"),
+        BotCommand("task", "Get a Gmail task"),
+        BotCommand("submit", "Submit a screenshot"),
+        BotCommand("howitworks", "How it works"),
+        BotCommand("payment", "Payment info"),
+        BotCommand("requirements", "Requirements & rules"),
+        BotCommand("faq", "Frequently asked questions"),
+        BotCommand("support", "Contact support"),
+        BotCommand("language", "Switch language / ቋንቋ ቀይር"),
+        BotCommand("cancel", "Cancel the current step"),
+    ])
+
 # --- Main Entry Point ---
 if __name__ == "__main__":
     threading.Thread(target=run_health_server, daemon=True).start()
 
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
 
+    conversation_fallbacks = [
+        CommandHandler("cancel", cancel),
+        CommandHandler("start", start_and_end),
+    ]
+
+    # FIX: the old pattern was "^start_submit_screenshot\$" which looks for a literal "$"
+    # character and never matched, so the Submit Screenshot button did nothing.
     screenshot_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(start_screenshot_submission, pattern="^start_submit_screenshot\$")],
+        entry_points=[
+            CallbackQueryHandler(start_screenshot_submission, pattern="^start_submit_screenshot$"),
+            CommandHandler("submit", start_screenshot_submission),
+        ],
         states={
-            WAITING_SCREENSHOT: [MessageHandler(filters.PHOTO, receive_screenshot)],
+            WAITING_SCREENSHOT: [
+                MessageHandler(filters.PHOTO, receive_screenshot),
+                MessageHandler(~filters.PHOTO & ~filters.COMMAND, screenshot_wrong_input),
+            ],
         },
-        fallbacks=[],
+        fallbacks=conversation_fallbacks,
+        allow_reentry=True,
     )
 
     payment_conv = ConversationHandler(
@@ -548,7 +661,8 @@ if __name__ == "__main__":
         states={
             WAITING_PAYMENT_DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_payment_details)],
         },
-        fallbacks=[],
+        fallbacks=conversation_fallbacks,
+        allow_reentry=True,
     )
 
     receipt_conv = ConversationHandler(
@@ -556,17 +670,31 @@ if __name__ == "__main__":
         states={
             WAITING_RECEIPT_PHOTO: [MessageHandler(filters.PHOTO, receive_admin_receipt)],
         },
-        fallbacks=[],
+        fallbacks=conversation_fallbacks,
+        allow_reentry=True,
     )
 
     app.add_handler(screenshot_conv)
     app.add_handler(payment_conv)
     app.add_handler(receipt_conv)
 
-    app.add_handler(CommandHandler("start", start))
+    # Typed commands
+    app.add_handler(CommandHandler(["start", "menu", "help"], start))
     app.add_handler(CommandHandler("language", set_language_cmd))
+    app.add_handler(CommandHandler(["howitworks", "how"], cmd_how))
+    app.add_handler(CommandHandler(["payment", "paymentinfo"], cmd_payment))
+    # "requirments" is included because it's a very common typo
+    app.add_handler(CommandHandler(["requirements", "requirement", "requirments", "rules"], cmd_requirements))
+    app.add_handler(CommandHandler("faq", cmd_faq))
+    app.add_handler(CommandHandler(["task", "gettask"], cmd_task))
+    app.add_handler(CommandHandler("support", cmd_support))
+    app.add_handler(CommandHandler("cancel", cancel))
+
+    # Button callbacks
     app.add_handler(CallbackQueryHandler(admin_decision, pattern="^adm_approve_|^adm_reject_"))
     app.add_handler(CallbackQueryHandler(buttons))
+
+    app.add_error_handler(error_handler)
 
     print("MailPay Ethiopia proxy bot is running...")
     app.run_polling()
