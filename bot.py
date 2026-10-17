@@ -1,10 +1,15 @@
+import asyncio
+import csv
 import html
+import io
 import os
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, BotCommandScopeChat, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest, RetryAfter
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -12,11 +17,22 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
 # --- Conversation States ---
-WAITING_SCREENSHOT, WAITING_PAYMENT_DETAILS, WAITING_RECEIPT_PHOTO, WAITING_ADMIN_REPLY = range(4)
+(
+    WAITING_SCREENSHOT,
+    WAITING_PAYMENT_DETAILS,
+    WAITING_RECEIPT_PHOTO,
+    WAITING_ADMIN_REPLY,
+    WAITING_ADMIN_SEARCH,
+    WAITING_BROADCAST,
+) = range(6)
+
+PAY_PER_ACCOUNT = 10                      # ETB paid for each verified account
+EAT = timezone(timedelta(hours=3))        # Ethiopian time, used for dates in the admin panel
 
 # --- Contact-through-the-bot settings ---
 ACK_WINDOW = 30 * 60     # seconds: full auto-reply at most once per 30 min per user
@@ -61,6 +77,163 @@ TOKEN = os.getenv("BOT_TOKEN")
 
 if not TOKEN:
     raise ValueError("Error: BOT_TOKEN is missing. Please check your environment variables.")
+
+# =====================================================================
+# DATABASE
+# Uses Postgres when DATABASE_URL is set (recommended on Render, e.g. a free
+# Neon database). Otherwise it falls back to a local SQLite file, which is fine
+# on your own computer / a server with a disk, but is WIPED on Render's free plan.
+# =====================================================================
+DATABASE_URL = os.getenv("DATABASE_URL")
+SQLITE_PATH = os.getenv("SQLITE_PATH", "mailpay.db")
+USE_PG = bool(DATABASE_URL)
+
+if USE_PG:
+    try:
+        import psycopg2
+    except ImportError:
+        raise ImportError("DATABASE_URL is set, but psycopg2 is missing. Add 'psycopg2-binary' to requirements.txt")
+else:
+    import sqlite3
+
+
+def _connect():
+    if USE_PG:
+        return psycopg2.connect(DATABASE_URL)
+    return sqlite3.connect(SQLITE_PATH, timeout=15)
+
+
+def _run(sql, params=(), mode="exec"):
+    """Runs one SQL statement. mode: 'exec' (no result), 'one' (dict or None), 'all' (list of dicts)."""
+    if USE_PG:
+        sql = sql.replace("?", "%s")
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        result = None
+        if mode in ("one", "all") and cur.description is not None:
+            cols = [d[0] for d in cur.description]
+            if mode == "one":
+                row = cur.fetchone()
+                result = dict(zip(cols, row)) if row else None
+            else:
+                result = [dict(zip(cols, r)) for r in cur.fetchall()]
+        conn.commit()
+        return result
+    finally:
+        conn.close()
+
+
+async def db(sql, params=(), mode="exec"):
+    # runs in a worker thread so a slow database never freezes the bot
+    return await asyncio.to_thread(_run, sql, params, mode)
+
+
+def init_db():
+    pk = "SERIAL PRIMARY KEY" if USE_PG else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    _run("""CREATE TABLE IF NOT EXISTS users (
+        user_id BIGINT PRIMARY KEY,
+        username TEXT,
+        full_name TEXT,
+        lang TEXT DEFAULT 'en',
+        first_seen BIGINT,
+        last_seen BIGINT)""")
+    _run(f"""CREATE TABLE IF NOT EXISTS submissions (
+        id {pk},
+        user_id BIGINT NOT NULL,
+        photo_id TEXT,
+        status TEXT DEFAULT 'pending',
+        payout_status TEXT DEFAULT 'none',
+        method TEXT,
+        payment_details TEXT,
+        amount INTEGER DEFAULT {PAY_PER_ACCOUNT},
+        created_at BIGINT,
+        decided_at BIGINT,
+        paid_at BIGINT)""")
+    _run("CREATE INDEX IF NOT EXISTS idx_sub_status ON submissions (status, payout_status)")
+
+
+# --- small helpers used by the admin panel ---
+def fmt_time(ts):
+    if not ts:
+        return "-"
+    return datetime.fromtimestamp(int(ts), tz=EAT).strftime("%d %b %H:%M")
+
+
+def ago(ts):
+    seconds = max(0, int(time.time()) - int(ts or 0))
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        return f"{seconds // 60}m ago"
+    if seconds < 86400:
+        return f"{seconds // 3600}h ago"
+    return f"{seconds // 86400}d ago"
+
+
+def short(text, n=18):
+    text = str(text or "")
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+def display_name(row):
+    if row.get("full_name"):
+        return row["full_name"]
+    if row.get("username"):
+        return "@" + row["username"]
+    return str(row.get("user_id"))
+
+
+def user_link(user_id, name):
+    return f'<a href="tg://user?id={user_id}">{html.escape(name)}</a>'
+
+
+def username_html(row):
+    return f"@{html.escape(row['username'])}" if row.get("username") else "no username"
+
+
+async def get_submission(sub_id):
+    return await db(
+        "SELECT s.*, u.username, u.full_name, u.lang FROM submissions s "
+        "LEFT JOIN users u ON u.user_id = s.user_id WHERE s.id = ?",
+        (sub_id,), "one",
+    )
+
+
+async def set_lang(user_id, lang):
+    USER_LANG[user_id] = lang
+    try:
+        await db("UPDATE users SET lang = ? WHERE user_id = ?", (lang, user_id))
+    except Exception as e:
+        print(f"Failed to save language: {e}")
+
+
+_SEEN = {}
+
+
+async def track_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Runs before every other handler: remembers who has used the bot."""
+    user = update.effective_user
+    if not user or user.is_bot:
+        return
+    now = int(time.time())
+    name = user.full_name or ""
+    cached = _SEEN.get(user.id)
+    if cached and cached[0] == user.username and cached[1] == name and now - cached[2] < 600:
+        return
+    try:
+        await db(
+            "INSERT INTO users (user_id, username, full_name, lang, first_seen, last_seen) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (user_id) DO UPDATE SET username = excluded.username, "
+            "full_name = excluded.full_name, last_seen = excluded.last_seen",
+            (user.id, user.username, name, get_lang(user.id), now, now),
+        )
+        _SEEN[user.id] = (user.username, name, now)
+    except Exception as e:
+        print(f"Failed to track user: {e}")
+
 
 # --- Multilingual Text Content ---
 # NOTE: messages sent with parse_mode="Markdown" use *single stars* for bold.
@@ -131,6 +304,8 @@ TEXTS = {
         "contact_prompt": "✉️ *CONTACT ADMIN*\n\nType your message below and send it (text, photo or voice note).\nThe Admin will reply to you right here in this chat.",
         "contact_ack": "✅ *Message received!*\n\nThank you for contacting MailPay. The Admin has been notified and will reply to you here as soon as possible.",
         "contact_sent_short": "✅ Sent to Admin.",
+        "payment_sent": "🎉 *PAYMENT SENT!*\n\nYour payment of *10 ETB* has been transferred to your account.\n\nThank you for working with MailPay 🇪🇹!",
+        "payment_unavailable": "⚠️ This payment request is no longer available.",
         "contact_failed": "⚠️ Sorry, your message could not be delivered. Please try again later or contact {support} directly.",
         "task_request_sent": "✅ *Request sent!*\n\nThe Admin has been notified and will send your account details (name, email, year of birth, password) here in this chat shortly.\n\nOnce you have created the account, tap '📸 Submit Screenshot'.",
         "task_already": "⏳ You already sent a request a moment ago. Please wait for the Admin to reply.",
@@ -217,6 +392,8 @@ TEXTS = {
         "contact_prompt": "✉️ *Adminን ያናግሩ*\n\nመልእክትዎን (ጽሑፍ፣ ፎቶ ወይም የድምጽ መልእክት) ከታች ይጻፉና ይላኩ።\nAdmin እዚሁ ቻት ውስጥ መልስ ይሰጥዎታል።",
         "contact_ack": "✅ *መልእክትዎ ደርሷል!*\n\nMailPayን ስላናገሩ እናመሰግናለን። Admin ተነግሮታል፤ በተቻለ ፍጥነት እዚሁ መልስ ይሰጥዎታል።",
         "contact_sent_short": "✅ ለAdmin ተልኳል።",
+        "payment_sent": "🎉 *ክፍያዎ ተላከ!*\n\nየ *10 ETB* ክፍያዎ ወደ ሂሳብዎ ተልኳል።\n\nከ MailPay 🇪🇹 ጋር ስለሰሩ እናመሰግናለን!",
+        "payment_unavailable": "⚠️ ይህ የክፍያ ጥያቄ አሁን አይገኝም።",
         "contact_failed": "⚠️ ይቅርታ፣ መልእክትዎ አልደረሰም። እባክዎ ቆይተው እንደገና ይሞክሩ ወይም {support}ን በቀጥታ ያናግሩ።",
         "task_request_sent": "✅ *ጥያቄዎ ተልኳል!*\n\nAdmin ተነግሮታል፤ የአካውንት መረጃዎን (ስም፣ ኢሜይል፣ የልደት ዘመን፣ የይለፍ ቃል) በቅርቡ እዚሁ ቻት ይልክልዎታል።\n\nአካውንቱን ከከፈቱ በኋላ '📸 Submit Screenshot' ይጫኑ።",
         "task_already": "⏳ ጥያቄ ልከዋል። እባክዎ Admin እስኪመልስ ይጠብቁ።",
@@ -339,7 +516,7 @@ async def set_language_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     current_lang = get_lang(user_id)
     new_lang = "am" if current_lang == "en" else "en"
-    USER_LANG[user_id] = new_lang
+    await set_lang(user_id, new_lang)
     msg = "🌐 Language changed to English!" if new_lang == "en" else "🌐 ቋንቋ ወደ አማርኛ ተቀይሯል!"
     await update.message.reply_text(msg, reply_markup=main_menu(new_lang))
 
@@ -376,8 +553,8 @@ async def cmd_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/cancel - leaves any screenshot / payment / receipt step and shows the menu."""
     lang = get_lang(update.effective_user.id)
-    context.user_data.pop("pending_receipt_user", None)
-    context.user_data.pop("reply_target", None)
+    for key in ("pending_receipt_sub", "reply_target", "broadcast"):
+        context.user_data.pop(key, None)
     await update.message.reply_text(TEXTS[lang]["cancelled"], reply_markup=main_menu(lang))
     return ConversationHandler.END
 
@@ -400,7 +577,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "toggle_language":
         new_lang = "am" if lang == "en" else "en"
-        USER_LANG[user_id] = new_lang
+        await set_lang(user_id, new_lang)
         new_t = TEXTS[new_lang]
         await query.edit_message_text(new_t["welcome"], reply_markup=main_menu(new_lang))
 
@@ -453,29 +630,32 @@ async def receive_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user = update.message.from_user
     lang = get_lang(user.id)
     photo_id = update.message.photo[-1].file_id
+    now = int(time.time())
+
+    try:
+        row = await db(
+            "INSERT INTO submissions (user_id, photo_id, status, payout_status, amount, created_at) "
+            "VALUES (?, ?, 'pending', 'none', ?, ?) RETURNING id",
+            (user.id, photo_id, PAY_PER_ACCOUNT, now), "one",
+        )
+        sub_id = row["id"]
+    except Exception as e:
+        print(f"Failed to save submission: {e}")
+        await update.message.reply_text(TEXTS[lang]["contact_failed"].format(support=SUPPORT_USERNAME))
+        return ConversationHandler.END
 
     if ADMIN_CHAT_ID:
         try:
-            # HTML mode so usernames containing "_" can't break the message
-            username = html.escape(user.username) if user.username else "No Username"
-            admin_caption = (
-                f"🚨 <b>NEW SCREENSHOT SUBMISSION</b>\n\n"
-                f"👤 <b>User:</b> @{username} (ID: <code>{user.id}</code>)\n"
-                f"🌐 <b>Preferred Lang:</b> {lang.upper()}\n"
-                f"Is this the correct Gmail account based on the provided info?"
-            )
-            admin_keyboard = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("✅ Approve", callback_data=f"adm_approve_{user.id}"),
-                    InlineKeyboardButton("❌ Reject", callback_data=f"adm_reject_{user.id}"),
-                ]
-            ])
+            sub = {
+                "id": sub_id, "user_id": user.id, "username": user.username,
+                "full_name": user.full_name, "lang": lang, "created_at": now,
+            }
             await context.bot.send_photo(
                 chat_id=ADMIN_CHAT_ID,
                 photo=photo_id,
-                caption=admin_caption,
+                caption=submission_caption(sub),
                 parse_mode="HTML",
-                reply_markup=admin_keyboard,
+                reply_markup=decision_keyboard(sub_id),
             )
         except Exception as e:
             print(f"Failed to forward screenshot to admin: {e}")
@@ -487,30 +667,95 @@ async def receive_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
     return ConversationHandler.END
 
-# --- Admin Decision Handler ---
+
+# --- Shared admin message builders ---
+def decision_keyboard(sub_id):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Approve", callback_data=f"adm_approve_{sub_id}"),
+            InlineKeyboardButton("❌ Reject", callback_data=f"adm_reject_{sub_id}"),
+        ],
+        [InlineKeyboardButton("📋 Panel", callback_data="adm_panel")],
+    ])
+
+
+def submission_caption(sub, note=""):
+    text = (
+        f"🚨 <b>SCREENSHOT #{sub['id']}</b>\n\n"
+        f"👤 <b>User:</b> {user_link(sub['user_id'], display_name(sub))} ({username_html(sub)})\n"
+        f"🆔 <b>ID:</b> <code>{sub['user_id']}</code>\n"
+        f"🌐 <b>Lang:</b> {(sub.get('lang') or 'en').upper()}\n"
+        f"🕒 <b>Sent:</b> {fmt_time(sub.get('created_at'))} (EAT)\n\n"
+        f"Is this the correct Gmail account based on the provided info?"
+    )
+    if note:
+        text += f"\n\n{note}"
+    return text
+
+
+def payout_text(sub):
+    return (
+        f"💸 <b>PAYOUT #{sub['id']}</b>\n\n"
+        f"👤 <b>User:</b> {user_link(sub['user_id'], display_name(sub))} ({username_html(sub)})\n"
+        f"🆔 <b>ID:</b> <code>{sub['user_id']}</code>\n"
+        f"🏦 <b>Method:</b> {html.escape(sub.get('method') or '-')}\n"
+        f"🔢 <b>Details:</b> <code>{html.escape(sub.get('payment_details') or '-')}</code>\n"
+        f"💰 <b>Amount:</b> {sub.get('amount') or PAY_PER_ACCOUNT} ETB"
+    )
+
+
+def payout_keyboard(sub_id, with_back=True):
+    rows = [[
+        InlineKeyboardButton("📸 Send Receipt", callback_data=f"adm_receipt_{sub_id}"),
+        InlineKeyboardButton("✅ Mark Paid", callback_data=f"adm_markpaid_{sub_id}"),
+    ]]
+    if with_back:
+        rows.append([InlineKeyboardButton("🔙 Payouts", callback_data="adm_payouts")])
+    return InlineKeyboardMarkup(rows)
+
+
+# --- Admin Decision Handler (Approve / Reject) ---
 async def admin_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    if query.from_user.id != ADMIN_CHAT_ID:
+        await query.answer()
+        return
 
     parts = query.data.split("_")
     action = parts[1]
-    target_user_id = int(parts[2])
-    target_lang = get_lang(target_user_id)
+    sub_id = int(parts[2])
+    sub = await get_submission(sub_id)
 
+    if not sub:
+        await query.answer("Submission not found.", show_alert=True)
+        return
+    if sub["status"] != "pending":
+        await query.answer(f"Already {sub['status']}.", show_alert=True)
+        return
+    await query.answer()
+
+    target_user_id = sub["user_id"]
+    target_lang = get_lang(target_user_id)
+    now = int(time.time())
     original_caption = query.message.caption_html or ""
+    after_keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("⏳ Pending list", callback_data="adm_pending"),
+        InlineKeyboardButton("📋 Panel", callback_data="adm_panel"),
+    ]])
 
     if action == "approve":
+        await db("UPDATE submissions SET status = 'approved', decided_at = ? WHERE id = ?", (now, sub_id))
         await query.edit_message_caption(
             caption=f"{original_caption}\n\n✅ <b>STATUS: APPROVED</b>\nUser notified to enter payment details.",
             parse_mode="HTML",
+            reply_markup=after_keyboard,
         )
 
         method_keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Telebirr", callback_data=f"user_method_Telebirr_{target_user_id}")],
-            [InlineKeyboardButton("M-Pesa", callback_data=f"user_method_M-Pesa_{target_user_id}")],
-            [InlineKeyboardButton("Commercial Bank of Ethiopia (CBE)", callback_data=f"user_method_CBE_{target_user_id}")],
+            [InlineKeyboardButton("Telebirr", callback_data=f"user_method_Telebirr_{sub_id}")],
+            [InlineKeyboardButton("M-Pesa", callback_data=f"user_method_M-Pesa_{sub_id}")],
+            [InlineKeyboardButton("Commercial Bank of Ethiopia (CBE)", callback_data=f"user_method_CBE_{sub_id}")],
         ])
-
         try:
             await context.bot.send_message(
                 chat_id=target_user_id,
@@ -522,11 +767,12 @@ async def admin_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
             print(f"Failed to notify user {target_user_id}: {e}")
 
     elif action == "reject":
+        await db("UPDATE submissions SET status = 'rejected', decided_at = ? WHERE id = ?", (now, sub_id))
         await query.edit_message_caption(
             caption=f"{original_caption}\n\n❌ <b>STATUS: REJECTED</b>",
             parse_mode="HTML",
+            reply_markup=after_keyboard,
         )
-
         try:
             await context.bot.send_message(
                 chat_id=target_user_id,
@@ -536,17 +782,34 @@ async def admin_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             print(f"Failed to notify user {target_user_id}: {e}")
 
+
 # --- Payment Collection Flow ---
 async def select_payment_method(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
-
-    parts = query.data.split("_")
-    method = parts[2]
     user_id = query.from_user.id
     lang = get_lang(user_id)
 
+    parts = query.data.split("_")
+    method = parts[2]
+    try:
+        sub_id = int(parts[3])
+    except (IndexError, ValueError):
+        sub_id = 0
+
+    sub = await get_submission(sub_id) if sub_id else None
+    if (
+        not sub
+        or sub["user_id"] != user_id
+        or sub["status"] != "approved"
+        or sub["payout_status"] not in ("none", "awaiting_details")
+    ):
+        await query.answer(TEXTS[lang]["payment_unavailable"], show_alert=True)
+        return ConversationHandler.END
+
+    await query.answer()
+    await db("UPDATE submissions SET method = ?, payout_status = 'awaiting_details' WHERE id = ?", (method, sub_id))
     context.user_data["payment_method"] = method
+    context.user_data["payment_sub"] = sub_id
 
     await query.edit_message_text(
         TEXTS[lang]["prompt_payment"].format(method=method),
@@ -554,34 +817,36 @@ async def select_payment_method(update: Update, context: ContextTypes.DEFAULT_TY
     )
     return WAITING_PAYMENT_DETAILS
 
+
 async def receive_payment_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_details = update.message.text
-    method = context.user_data.get("payment_method", "Payment Method")
     user = update.message.from_user
     lang = get_lang(user.id)
+    details = (update.message.text or "").strip()[:200]
+    method = context.user_data.get("payment_method", "Payment Method")
+    sub_id = context.user_data.get("payment_sub")
 
-    if ADMIN_CHAT_ID:
-        try:
-            username = html.escape(user.username) if user.username else "No Username"
-            admin_msg = (
-                f"💳 <b>PAYMENT DETAILS SUBMITTED</b>\n\n"
-                f"👤 <b>User:</b> @{username} (ID: <code>{user.id}</code>)\n"
-                f"🏦 <b>Method:</b> {html.escape(method)}\n"
-                f"🔢 <b>Details:</b> <code>{html.escape(user_details)}</code>\n\n"
-                f"📸 <b>Next Step:</b> Tap the button below to send the payout receipt photo once transferred."
-            )
-            receipt_btn = InlineKeyboardMarkup([
-                [InlineKeyboardButton("📸 Send Payment Receipt", callback_data=f"adm_receipt_{user.id}")]
-            ])
+    if not sub_id:
+        await update.message.reply_text(TEXTS[lang]["payment_unavailable"], reply_markup=main_menu(lang))
+        return ConversationHandler.END
+
+    try:
+        await db(
+            "UPDATE submissions SET payment_details = ?, method = ?, payout_status = 'pending_payout' "
+            "WHERE id = ? AND user_id = ?",
+            (details, method, sub_id, user.id),
+        )
+        sub = await get_submission(sub_id)
+        if ADMIN_CHAT_ID and sub:
             await context.bot.send_message(
                 chat_id=ADMIN_CHAT_ID,
-                text=admin_msg,
+                text=payout_text(sub),
                 parse_mode="HTML",
-                reply_markup=receipt_btn,
+                reply_markup=payout_keyboard(sub_id, with_back=False),
             )
-        except Exception as e:
-            print(f"Failed to send payment details to admin: {e}")
+    except Exception as e:
+        print(f"Failed to save/send payment details: {e}")
 
+    context.user_data.pop("payment_sub", None)
     await update.message.reply_text(
         TEXTS[lang]["payment_received"],
         parse_mode="Markdown",
@@ -589,28 +854,45 @@ async def receive_payment_details(update: Update, context: ContextTypes.DEFAULT_
     )
     return ConversationHandler.END
 
+
 # --- Admin Receipt Delivery Flow ---
 async def start_receipt_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    if query.from_user.id != ADMIN_CHAT_ID:
+        return ConversationHandler.END
 
-    parts = query.data.split("_")
-    target_user_id = int(parts[2])
-    context.user_data["pending_receipt_user"] = target_user_id
+    sub_id = int(query.data.split("_")[2])
+    sub = await get_submission(sub_id)
+    if not sub:
+        await query.message.reply_text("⚠️ Submission not found.")
+        return ConversationHandler.END
+    if sub["payout_status"] == "paid":
+        await query.message.reply_text(f"ℹ️ Payout #{sub_id} is already marked as paid.")
+        return ConversationHandler.END
 
-    await query.edit_message_text(
-        f"📸 *SEND PAYMENT RECEIPT*\n\nPlease upload/send the transfer receipt photo now for User ID: `{target_user_id}`.",
-        parse_mode="Markdown",
+    context.user_data["pending_receipt_sub"] = sub_id
+    await query.message.reply_text(
+        f"📸 SEND PAYMENT RECEIPT\n\nSend the transfer receipt photo now for payout #{sub_id} "
+        f"(user ID {sub['user_id']}).\nSend /cancel to stop."
     )
     return WAITING_RECEIPT_PHOTO
 
-async def receive_admin_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    target_user_id = context.user_data.get("pending_receipt_user")
 
-    if not target_user_id:
-        await update.message.reply_text("⚠️ No user session found to send this receipt to.")
+async def receipt_wrong_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⚠️ Please send the receipt as a photo, or /cancel.")
+    return WAITING_RECEIPT_PHOTO
+
+
+async def receive_admin_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sub_id = context.user_data.get("pending_receipt_sub")
+    sub = await get_submission(sub_id) if sub_id else None
+
+    if not sub:
+        await update.message.reply_text("⚠️ No payout selected to send this receipt for.")
         return ConversationHandler.END
 
+    target_user_id = sub["user_id"]
     target_lang = get_lang(target_user_id)
     photo_file_id = update.message.photo[-1].file_id
 
@@ -621,15 +903,395 @@ async def receive_admin_receipt(update: Update, context: ContextTypes.DEFAULT_TY
             caption=TEXTS[target_lang]["receipt_delivered"],
             parse_mode="Markdown",
         )
+        await db("UPDATE submissions SET payout_status = 'paid', paid_at = ? WHERE id = ?", (int(time.time()), sub_id))
         await update.message.reply_text(
-            f"✅ *Receipt successfully delivered to user (ID: `{target_user_id}`)!*",
-            parse_mode="Markdown",
+            f"✅ Receipt delivered to user (ID: {target_user_id}). Payout #{sub_id} marked as paid.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("💸 Payouts", callback_data="adm_payouts"),
+                InlineKeyboardButton("📋 Panel", callback_data="adm_panel"),
+            ]]),
         )
     except Exception as e:
         await update.message.reply_text(f"❌ Failed to deliver receipt to user: {e}")
 
-    context.user_data.pop("pending_receipt_user", None)
+    context.user_data.pop("pending_receipt_sub", None)
     return ConversationHandler.END
+
+
+# =====================================================================
+# ADMIN PANEL  (/admin - only works for ADMIN_CHAT_ID)
+# =====================================================================
+def panel_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📊 Stats", callback_data="adm_stats"),
+            InlineKeyboardButton("⏳ Pending", callback_data="adm_pending"),
+        ],
+        [
+            InlineKeyboardButton("💸 Payouts", callback_data="adm_payouts"),
+            InlineKeyboardButton("🔍 Find customer", callback_data="adm_find"),
+        ],
+        [
+            InlineKeyboardButton("📢 Broadcast", callback_data="adm_bc"),
+            InlineKeyboardButton("📤 Export CSV", callback_data="adm_export"),
+        ],
+    ])
+
+
+def back_to_panel():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Panel", callback_data="adm_panel")]])
+
+
+def back_to_payouts():
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("💸 Payouts", callback_data="adm_payouts"),
+        InlineKeyboardButton("📋 Panel", callback_data="adm_panel"),
+    ]])
+
+
+async def panel_text():
+    pending = (await db("SELECT COUNT(*) AS n FROM submissions WHERE status = 'pending'", (), "one"))["n"]
+    owed = await db(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(amount), 0) AS total FROM submissions "
+        "WHERE status = 'approved' AND payout_status = 'pending_payout'", (), "one",
+    )
+    return (
+        "🛠 <b>ADMIN PANEL</b>\n\n"
+        f"⏳ Pending screenshots: <b>{pending}</b>\n"
+        f"💸 Payouts to send: <b>{owed['n']}</b> ({int(owed['total'])} ETB)\n\n"
+        "Choose an option 👇"
+    )
+
+
+async def show(query, text, reply_markup=None):
+    """Edits the current message, or sends a new one if it is a photo (photos can't be edited into text)."""
+    msg = query.message
+    try:
+        if msg.photo or msg.document:
+            await msg.reply_text(text, parse_mode="HTML", reply_markup=reply_markup)
+        else:
+            await msg.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            raise
+
+
+async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(await panel_text(), parse_mode="HTML", reply_markup=panel_keyboard())
+
+
+async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles every simple admin-panel button."""
+    query = update.callback_query
+    if query.from_user.id != ADMIN_CHAT_ID:
+        await query.answer()
+        return
+    await query.answer()
+    data = query.data
+
+    # ---- main panel
+    if data == "adm_panel":
+        await show(query, await panel_text(), panel_keyboard())
+
+    # ---- stats
+    elif data == "adm_stats":
+        total_users = (await db("SELECT COUNT(*) AS n FROM users WHERE user_id != ?", (ADMIN_CHAT_ID,), "one"))["n"]
+        midnight = int(datetime.now(EAT).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+        new_today = (await db(
+            "SELECT COUNT(*) AS n FROM users WHERE user_id != ? AND first_seen >= ?", (ADMIN_CHAT_ID, midnight), "one"
+        ))["n"]
+        by_status = {
+            r["status"]: r["n"]
+            for r in await db("SELECT status, COUNT(*) AS n FROM submissions GROUP BY status", (), "all")
+        }
+        pay_rows = await db(
+            "SELECT payout_status, COUNT(*) AS n, COALESCE(SUM(amount), 0) AS total FROM submissions "
+            "WHERE status = 'approved' GROUP BY payout_status", (), "all",
+        )
+        pay = {r["payout_status"]: (r["n"], int(r["total"])) for r in pay_rows}
+        pending, approved, rejected = (by_status.get(k, 0) for k in ("pending", "approved", "rejected"))
+        to_pay_n, to_pay_amt = pay.get("pending_payout", (0, 0))
+        paid_n, paid_amt = pay.get("paid", (0, 0))
+        waiting_n = pay.get("none", (0, 0))[0] + pay.get("awaiting_details", (0, 0))[0]
+        text = (
+            "📊 <b>STATS</b>\n\n"
+            f"👥 Customers: <b>{total_users}</b> (+{new_today} today)\n\n"
+            f"📸 Submissions: <b>{pending + approved + rejected}</b>\n"
+            f"   ⏳ Pending: {pending}\n"
+            f"   ✅ Approved: {approved}\n"
+            f"   ❌ Rejected: {rejected}\n\n"
+            "💸 <b>Payouts</b>\n"
+            f"   To pay now: <b>{to_pay_n}</b> ({to_pay_amt} ETB)\n"
+            f"   Waiting for customer's payment details: {waiting_n}\n"
+            f"   Paid: <b>{paid_n}</b> ({paid_amt} ETB)"
+        )
+        await show(query, text, back_to_panel())
+
+    # ---- pending screenshots
+    elif data == "adm_pending":
+        rows = await db(
+            "SELECT s.id, s.created_at, s.user_id, u.username, u.full_name FROM submissions s "
+            "LEFT JOIN users u ON u.user_id = s.user_id WHERE s.status = 'pending' ORDER BY s.id ASC LIMIT 15",
+            (), "all",
+        )
+        if not rows:
+            await show(query, "✅ <b>No pending screenshots.</b>", back_to_panel())
+            return
+        keyboard = [
+            [InlineKeyboardButton(
+                f"#{r['id']} · {short(display_name(r))} · {ago(r['created_at'])}",
+                callback_data=f"adm_view_{r['id']}",
+            )]
+            for r in rows
+        ]
+        keyboard.append([InlineKeyboardButton("🔙 Panel", callback_data="adm_panel")])
+        await show(
+            query,
+            f"⏳ <b>PENDING SCREENSHOTS</b> ({len(rows)})\n\nTap one to review it 👇",
+            InlineKeyboardMarkup(keyboard),
+        )
+
+    elif data.startswith("adm_view_"):
+        sub = await get_submission(int(data.split("_")[2]))
+        if not sub:
+            await show(query, "⚠️ Submission not found.", back_to_panel())
+            return
+        if sub["status"] == "pending":
+            note, keyboard = "", decision_keyboard(sub["id"])
+        else:
+            note = f"Status: <b>{sub['status'].upper()}</b> · Payout: <b>{sub['payout_status']}</b>"
+            keyboard = back_to_panel()
+        try:
+            await context.bot.send_photo(
+                chat_id=ADMIN_CHAT_ID,
+                photo=sub["photo_id"],
+                caption=submission_caption(sub, note),
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+        except Exception as e:
+            await query.message.reply_text(f"❌ Could not load the screenshot: {e}")
+
+    # ---- payouts
+    elif data == "adm_payouts":
+        rows = await db(
+            "SELECT s.id, s.amount, s.method, s.user_id, u.username, u.full_name FROM submissions s "
+            "LEFT JOIN users u ON u.user_id = s.user_id "
+            "WHERE s.status = 'approved' AND s.payout_status = 'pending_payout' ORDER BY s.id ASC LIMIT 20",
+            (), "all",
+        )
+        if not rows:
+            await show(query, "✅ <b>No payouts waiting.</b>", back_to_panel())
+            return
+        total = sum(int(r["amount"] or PAY_PER_ACCOUNT) for r in rows)
+        keyboard = [
+            [InlineKeyboardButton(
+                f"#{r['id']} · {r['amount']} ETB · {r['method']} · {short(display_name(r), 14)}",
+                callback_data=f"adm_pay_{r['id']}",
+            )]
+            for r in rows
+        ]
+        keyboard.append([InlineKeyboardButton("🔙 Panel", callback_data="adm_panel")])
+        await show(
+            query,
+            f"💸 <b>PAYOUTS TO SEND</b>\n\n{len(rows)} waiting · total <b>{total} ETB</b>\n\nTap one for the payment details 👇",
+            InlineKeyboardMarkup(keyboard),
+        )
+
+    elif data.startswith("adm_pay_"):
+        sub = await get_submission(int(data.split("_")[2]))
+        if not sub:
+            await show(query, "⚠️ Payout not found.", back_to_payouts())
+            return
+        text = payout_text(sub)
+        if sub["payout_status"] == "paid":
+            text += f"\n\n✅ Paid on {fmt_time(sub.get('paid_at'))}"
+            await show(query, text, back_to_payouts())
+        else:
+            await show(query, text, payout_keyboard(sub["id"]))
+
+    elif data.startswith("adm_markpaid_"):
+        sub_id = int(data.split("_")[2])
+        sub = await get_submission(sub_id)
+        if not sub or sub["payout_status"] != "pending_payout":
+            await show(query, "ℹ️ This payout is not waiting to be paid (already paid, or not found).", back_to_payouts())
+            return
+        await db("UPDATE submissions SET payout_status = 'paid', paid_at = ? WHERE id = ?", (int(time.time()), sub_id))
+        note = ""
+        try:
+            await context.bot.send_message(
+                chat_id=sub["user_id"],
+                text=TEXTS[get_lang(sub["user_id"])]["payment_sent"],
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            note = f"\n⚠️ Could not notify the customer: {html.escape(str(e))}"
+        await show(query, f"✅ Payout #{sub_id} marked as paid.{note}", back_to_payouts())
+
+    # ---- export
+    elif data == "adm_export":
+        rows = await db(
+            "SELECT s.id, s.user_id, u.username, u.full_name, s.status, s.payout_status, s.method, "
+            "s.payment_details, s.amount, s.created_at, s.decided_at, s.paid_at FROM submissions s "
+            "LEFT JOIN users u ON u.user_id = s.user_id ORDER BY s.id",
+            (), "all",
+        )
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+        writer.writerow(["id", "user_id", "username", "name", "status", "payout_status", "method",
+                         "payment_details", "amount_etb", "submitted", "decided", "paid"])
+        for r in rows:
+            writer.writerow([
+                r["id"], r["user_id"], r["username"] or "", r["full_name"] or "", r["status"], r["payout_status"],
+                r["method"] or "", r["payment_details"] or "", r["amount"],
+                fmt_time(r["created_at"]), fmt_time(r["decided_at"]), fmt_time(r["paid_at"]),
+            ])
+        file_bytes = io.BytesIO(buffer.getvalue().encode("utf-8-sig"))  # utf-8-sig so Excel shows Amharic names
+        await context.bot.send_document(
+            chat_id=ADMIN_CHAT_ID,
+            document=file_bytes,
+            filename=f"mailpay_{datetime.now(EAT).strftime('%Y-%m-%d')}.csv",
+            caption=f"📤 {len(rows)} submissions",
+        )
+
+    # ---- broadcast confirmation
+    elif data == "adm_bc_cancel":
+        context.user_data.pop("broadcast", None)
+        await show(query, "❌ Broadcast cancelled.", back_to_panel())
+
+    elif data == "adm_bc_confirm":
+        source = context.user_data.pop("broadcast", None)
+        if not source:
+            await show(query, "⚠️ Nothing to send. Start again from the panel.", back_to_panel())
+            return
+        await show(query, "📢 Sending… I'll message you when it's finished.")
+        # runs in the background so the bot keeps answering customers meanwhile
+        context.application.create_task(run_broadcast(context.bot, source, query.message.chat_id))
+
+
+async def run_broadcast(bot, source, report_chat_id):
+    chat_id, message_id = source
+    rows = await db("SELECT user_id FROM users WHERE user_id != ?", (ADMIN_CHAT_ID,), "all")
+    sent = failed = 0
+    for r in rows:
+        uid = r["user_id"]
+        try:
+            await bot.copy_message(chat_id=uid, from_chat_id=chat_id, message_id=message_id)
+            sent += 1
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+            try:
+                await bot.copy_message(chat_id=uid, from_chat_id=chat_id, message_id=message_id)
+                sent += 1
+            except Exception:
+                failed += 1
+        except Exception:
+            failed += 1  # usually: the customer blocked the bot
+        await asyncio.sleep(0.06)  # stays under Telegram's rate limit
+    await bot.send_message(
+        chat_id=report_chat_id,
+        text=f"📢 Broadcast finished.\n✅ Delivered: {sent}\n❌ Failed (blocked the bot, etc.): {failed}",
+        reply_markup=back_to_panel(),
+    )
+
+
+# ---- Find customer (conversation)
+async def start_find(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ADMIN_CHAT_ID:
+        return ConversationHandler.END
+    await query.message.reply_text(
+        "🔍 <b>FIND CUSTOMER</b>\n\nSend a user ID (numbers) or a @username.\nSend /cancel to stop.",
+        parse_mode="HTML",
+    )
+    return WAITING_ADMIN_SEARCH
+
+
+async def do_find(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if text.lstrip("-").isdigit():
+        row = await db("SELECT * FROM users WHERE user_id = ?", (int(text),), "one")
+    else:
+        row = await db("SELECT * FROM users WHERE LOWER(username) = ?", (text.lstrip("@").lower(),), "one")
+
+    if not row:
+        await update.message.reply_text(
+            "❌ Not found. A customer shows up here after their first message to the bot.\n"
+            "Try again, or send /cancel."
+        )
+        return WAITING_ADMIN_SEARCH
+
+    uid = row["user_id"]
+    groups = await db(
+        "SELECT status, payout_status, COUNT(*) AS n, COALESCE(SUM(amount), 0) AS total FROM submissions "
+        "WHERE user_id = ? GROUP BY status, payout_status", (uid,), "all",
+    )
+    counts = {"pending": 0, "approved": 0, "rejected": 0}
+    paid_total = 0
+    for g in groups:
+        counts[g["status"]] = counts.get(g["status"], 0) + g["n"]
+        if g["payout_status"] == "paid":
+            paid_total += int(g["total"])
+    recent = await db(
+        "SELECT id, status, payout_status, created_at FROM submissions WHERE user_id = ? ORDER BY id DESC LIMIT 8",
+        (uid,), "all",
+    )
+    icons = {"pending": "⏳", "approved": "✅", "rejected": "❌"}
+    history = "\n".join(
+        f"#{s['id']} · {fmt_time(s['created_at'])} · {icons.get(s['status'], '')} {s['status']}"
+        + (f" · 💸 {s['payout_status']}" if s["status"] == "approved" else "")
+        for s in recent
+    ) or "No submissions yet."
+
+    card = (
+        f"👤 <b>{html.escape(display_name(row))}</b> ({username_html(row)})\n"
+        f"🆔 <code>{uid}</code>\n"
+        f"🌐 Language: {(row.get('lang') or 'en').upper()}\n"
+        f"📅 First seen: {fmt_time(row.get('first_seen'))} · Last active: {ago(row.get('last_seen'))}\n\n"
+        f"📸 Submissions: ⏳ {counts['pending']} · ✅ {counts['approved']} · ❌ {counts['rejected']}\n"
+        f"💰 Paid so far: <b>{paid_total} ETB</b>\n\n"
+        f"<b>Recent</b>\n{history}"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✍️ Message this customer", callback_data=f"adm_reply_{uid}")],
+        [InlineKeyboardButton("🔙 Panel", callback_data="adm_panel")],
+    ])
+    await update.message.reply_text(card, parse_mode="HTML", reply_markup=keyboard)
+    return ConversationHandler.END
+
+
+# ---- Broadcast (conversation)
+async def start_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ADMIN_CHAT_ID:
+        return ConversationHandler.END
+    await query.message.reply_text(
+        "📢 <b>BROADCAST</b>\n\nSend the announcement now (text or photo).\n"
+        "I'll ask you to confirm before anything is sent.\nSend /cancel to stop.",
+        parse_mode="HTML",
+    )
+    return WAITING_BROADCAST
+
+
+async def receive_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    n = (await db("SELECT COUNT(*) AS n FROM users WHERE user_id != ?", (ADMIN_CHAT_ID,), "one"))["n"]
+    if not n:
+        await msg.reply_text("ℹ️ There are no customers yet.")
+        return ConversationHandler.END
+    context.user_data["broadcast"] = (msg.chat_id, msg.message_id)
+    await msg.reply_text(
+        f"📢 Send the message above to <b>{n}</b> customers?",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Send now", callback_data="adm_bc_confirm"),
+            InlineKeyboardButton("❌ Cancel", callback_data="adm_bc_cancel"),
+        ]]),
+    )
+    return ConversationHandler.END
+
 
 # --- Contact Admin Through the Bot ---
 def admin_reply_keyboard(user_id):
@@ -788,9 +1450,18 @@ async def send_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     print(f"Error while handling an update: {context.error}")
 
-# --- Telegram "/" command menu ---
+
+# --- Startup: database + Telegram "/" command menu ---
 async def post_init(application: Application):
-    await application.bot.set_my_commands([
+    await asyncio.to_thread(init_db)
+    rows = await db("SELECT user_id, lang FROM users", (), "all")
+    for r in rows:
+        USER_LANG[r["user_id"]] = r["lang"] or "en"
+    print(f"Database ready ({'Postgres' if USE_PG else 'SQLite file: ' + SQLITE_PATH}) - {len(rows)} users loaded.")
+    if not USE_PG:
+        print("WARNING: DATABASE_URL is not set. On Render's free plan the SQLite file is deleted on every restart.")
+
+    commands = [
         BotCommand("start", "Open the main menu"),
         BotCommand("task", "Get a Gmail task"),
         BotCommand("submit", "Submit a screenshot"),
@@ -802,7 +1473,17 @@ async def post_init(application: Application):
         BotCommand("contact", "Message the Admin"),
         BotCommand("language", "Switch language / ቋንቋ ቀይር"),
         BotCommand("cancel", "Cancel the current step"),
-    ])
+    ]
+    await application.bot.set_my_commands(commands)
+    try:
+        # the /admin command is only listed in the admin's own command menu
+        await application.bot.set_my_commands(
+            commands + [BotCommand("admin", "Open the admin panel")],
+            scope=BotCommandScopeChat(chat_id=ADMIN_CHAT_ID),
+        )
+    except Exception as e:
+        print(f"Could not set admin command menu (start the bot from the admin account first): {e}")
+
 
 # --- Main Entry Point ---
 if __name__ == "__main__":
@@ -815,8 +1496,6 @@ if __name__ == "__main__":
         CommandHandler("start", start_and_end),
     ]
 
-    # FIX: the old pattern was "^start_submit_screenshot\$" which looks for a literal "$"
-    # character and never matched, so the Submit Screenshot button did nothing.
     screenshot_conv = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(start_screenshot_submission, pattern="^start_submit_screenshot$"),
@@ -842,16 +1521,19 @@ if __name__ == "__main__":
     )
 
     receipt_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(start_receipt_upload, pattern="^adm_receipt_")],
+        entry_points=[CallbackQueryHandler(start_receipt_upload, pattern=r"^adm_receipt_\d+$")],
         states={
-            WAITING_RECEIPT_PHOTO: [MessageHandler(filters.PHOTO, receive_admin_receipt)],
+            WAITING_RECEIPT_PHOTO: [
+                MessageHandler(filters.PHOTO, receive_admin_receipt),
+                MessageHandler(~filters.PHOTO & ~filters.COMMAND, receipt_wrong_input),
+            ],
         },
         fallbacks=conversation_fallbacks,
         allow_reentry=True,
     )
 
     admin_reply_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(start_admin_reply, pattern="^adm_reply_")],
+        entry_points=[CallbackQueryHandler(start_admin_reply, pattern=r"^adm_reply_\d+$")],
         states={
             WAITING_ADMIN_REPLY: [MessageHandler(~filters.COMMAND, send_admin_reply)],
         },
@@ -859,10 +1541,33 @@ if __name__ == "__main__":
         allow_reentry=True,
     )
 
+    find_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_find, pattern="^adm_find$")],
+        states={
+            WAITING_ADMIN_SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, do_find)],
+        },
+        fallbacks=conversation_fallbacks,
+        allow_reentry=True,
+    )
+
+    broadcast_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_broadcast, pattern="^adm_bc$")],
+        states={
+            WAITING_BROADCAST: [MessageHandler(~filters.COMMAND, receive_broadcast)],
+        },
+        fallbacks=conversation_fallbacks,
+        allow_reentry=True,
+    )
+
+    # Runs first for every update: remembers who uses the bot
+    app.add_handler(TypeHandler(Update, track_user), group=-1)
+
     app.add_handler(screenshot_conv)
     app.add_handler(payment_conv)
     app.add_handler(receipt_conv)
     app.add_handler(admin_reply_conv)
+    app.add_handler(find_conv)
+    app.add_handler(broadcast_conv)
 
     # Typed commands
     app.add_handler(CommandHandler(["start", "menu", "help"], start))
@@ -876,11 +1581,16 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("support", cmd_support))
     app.add_handler(CommandHandler("contact", contact_prompt))
     app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(CommandHandler("admin", admin_cmd, filters=filters.User(user_id=ADMIN_CHAT_ID)))
 
     # Button callbacks
     app.add_handler(CallbackQueryHandler(request_task, pattern="^request_task$"))
     app.add_handler(CallbackQueryHandler(contact_prompt, pattern="^contact_admin$"))
-    app.add_handler(CallbackQueryHandler(admin_decision, pattern="^adm_approve_|^adm_reject_"))
+    app.add_handler(CallbackQueryHandler(admin_decision, pattern=r"^adm_(approve|reject)_\d+$"))
+    app.add_handler(CallbackQueryHandler(
+        admin_router,
+        pattern=r"^adm_(panel|stats|pending|payouts|export|bc_confirm|bc_cancel)$|^adm_(view|pay|markpaid)_\d+$",
+    ))
     app.add_handler(CallbackQueryHandler(buttons))
 
     # Catch-all (must stay LAST): any normal private message from a customer goes to the admin.
