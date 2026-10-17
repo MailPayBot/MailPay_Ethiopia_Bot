@@ -1,6 +1,7 @@
 import html
 import os
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -15,7 +16,11 @@ from telegram.ext import (
 )
 
 # --- Conversation States ---
-WAITING_SCREENSHOT, WAITING_PAYMENT_DETAILS, WAITING_RECEIPT_PHOTO = range(3)
+WAITING_SCREENSHOT, WAITING_PAYMENT_DETAILS, WAITING_RECEIPT_PHOTO, WAITING_ADMIN_REPLY = range(4)
+
+# --- Contact-through-the-bot settings ---
+ACK_WINDOW = 30 * 60     # seconds: full auto-reply at most once per 30 min per user
+TASK_COOLDOWN = 5 * 60   # seconds: stops users spamming the "Get Gmail Task" request
 
 # --- Admin Telegram Configuration ---
 # --- Admin Telegram User ID ---
@@ -123,6 +128,16 @@ TEXTS = {
         "payment_received": "🎉 *Payment details submitted!*\n\nYour payment is being processed. A payment receipt will be sent directly to this chat once the transfer is complete.\n\nThank you for participating with MailPay 🇪🇹!",
         "receipt_delivered": "🎉 *GREAT NEWS! PAYMENT SENT!*\n\nYour payment of *10 ETB* has been transferred.\n\n📄 Attached above is your official payment transfer receipt.\n\nThank you for working with MailPay 🇪🇹!",
         "cancelled": "✅ Cancelled. Back to the main menu 👇",
+        "contact_prompt": "✉️ *CONTACT ADMIN*\n\nType your message below and send it (text, photo or voice note).\nThe Admin will reply to you right here in this chat.",
+        "contact_ack": "✅ *Message received!*\n\nThank you for contacting MailPay. The Admin has been notified and will reply to you here as soon as possible.",
+        "contact_sent_short": "✅ Sent to Admin.",
+        "contact_failed": "⚠️ Sorry, your message could not be delivered. Please try again later or contact {support} directly.",
+        "task_request_sent": "✅ *Request sent!*\n\nThe Admin has been notified and will send your account details (name, email, year of birth, password) here in this chat shortly.\n\nOnce you have created the account, tap '📸 Submit Screenshot'.",
+        "task_already": "⏳ You already sent a request a moment ago. Please wait for the Admin to reply.",
+        "admin_reply_header": "💬 *Message from Admin* 👇",
+        "support_text": "👤 CONTACT SUPPORT\n\nNeed help? Tap the button below to message the Admin right here in the bot.\n\nChannel: {channel}",
+        "btn_reply_admin": "💬 Reply to Admin",
+        "btn_contact_support": "💬 Message the Admin",
         "btn_get_task": "➕ Get Gmail Task",
         "btn_submit_ss": "📸 Submit Screenshot",
         "btn_how": "📚 How It Works",
@@ -199,6 +214,16 @@ TEXTS = {
         "payment_received": "🎉 *የክፍያ መረጃዎ ደርሷል!*\n\nክፍያዎ በመሰራት ላይ ነው። ክፍያው እንደተጠናቀቀ የክፍያ ደረሰኝ በቀጥታ እዚህ ይላክልዎታል።\n\nከ MailPay 🇪🇹 ጋር ስለሰሩ እናመሰግናለን!",
         "receipt_delivered": "🎉 *መልካም ዜና! ክፍያዎ ተላከ!*\n\nየ *10 ETB* ክፍያዎ ተላክል።\n\n📄 ይፋዊ የክፍያ ደረሰኝዎ ከላይ ተያይዟል።\n\nከ MailPay 🇪🇹 ጋር ስለሰሩ እናመሰግናለን!",
         "cancelled": "✅ ተሰርዟል። ወደ ዋና ማውጫ ተመልሰዋል 👇",
+        "contact_prompt": "✉️ *Adminን ያናግሩ*\n\nመልእክትዎን (ጽሑፍ፣ ፎቶ ወይም የድምጽ መልእክት) ከታች ይጻፉና ይላኩ።\nAdmin እዚሁ ቻት ውስጥ መልስ ይሰጥዎታል።",
+        "contact_ack": "✅ *መልእክትዎ ደርሷል!*\n\nMailPayን ስላናገሩ እናመሰግናለን። Admin ተነግሮታል፤ በተቻለ ፍጥነት እዚሁ መልስ ይሰጥዎታል።",
+        "contact_sent_short": "✅ ለAdmin ተልኳል።",
+        "contact_failed": "⚠️ ይቅርታ፣ መልእክትዎ አልደረሰም። እባክዎ ቆይተው እንደገና ይሞክሩ ወይም {support}ን በቀጥታ ያናግሩ።",
+        "task_request_sent": "✅ *ጥያቄዎ ተልኳል!*\n\nAdmin ተነግሮታል፤ የአካውንት መረጃዎን (ስም፣ ኢሜይል፣ የልደት ዘመን፣ የይለፍ ቃል) በቅርቡ እዚሁ ቻት ይልክልዎታል።\n\nአካውንቱን ከከፈቱ በኋላ '📸 Submit Screenshot' ይጫኑ።",
+        "task_already": "⏳ ጥያቄ ልከዋል። እባክዎ Admin እስኪመልስ ይጠብቁ።",
+        "admin_reply_header": "💬 *ከAdmin የመጣ መልእክት* 👇",
+        "support_text": "👤 እገዛ ለማግኘት\n\nእርዳታ ይፈልጋሉ? ከታች ያለውን ቁልፍ ተጭነው Adminን እዚሁ ቦት ውስጥ ያናግሩ።\n\nቻናል: {channel}",
+        "btn_reply_admin": "💬 ለAdmin መልስ ስጥ",
+        "btn_contact_support": "💬 Adminን ያናግሩ",
         "btn_get_task": "➕ Get Gmail Task / ስራ አግኝ",
         "btn_submit_ss": "📸 Submit Screenshot / ስክሪንሾት ላክ",
         "btn_how": "📚 How It Works / እንዴት እንደሚሰራ",
@@ -286,11 +311,10 @@ def faq_back(lang="en"):
         [InlineKeyboardButton("🏠 Main Menu" if not is_am else "🏠 ዋና ማውጫ", callback_data="main_menu")],
     ])
 
-def task_keyboard(lang, user_id):
+def task_keyboard(lang, user_id=None):
     t = TEXTS[lang]
-    dm_url = f"https://t.me/CHUNKLA47?text=Hi%20Admin,%20I%20want%20to%20create%20a%20Gmail%20account!%20My%20User%20ID:%20{user_id}"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(t["btn_contact_admin"], url=dm_url)],
+        [InlineKeyboardButton(t["btn_contact_admin"], callback_data="request_task")],
         [InlineKeyboardButton(t["btn_submit_ss"], callback_data="start_submit_screenshot")],
         [InlineKeyboardButton(t["btn_back"], callback_data="main_menu")],
     ])
@@ -298,14 +322,11 @@ def task_keyboard(lang, user_id):
 def support_content(lang):
     t = TEXTS[lang]
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💬 Contact Support Admin", url=SUPPORT_URL)],
+        [InlineKeyboardButton(t["btn_contact_support"], callback_data="contact_admin")],
         [InlineKeyboardButton("📢 Official Channel", url=CHANNEL_URL)],
         [InlineKeyboardButton(t["btn_back"], callback_data="main_menu")],
     ])
-    if lang == "en":
-        text = f"👤 CONTACT SUPPORT\n\nNeed help?\nContact support: {SUPPORT_USERNAME}\nChannel: {CHANNEL_URL}"
-    else:
-        text = f"👤 እገዛ ለማግኘት\n\nእርዳታ ይፈልጋሉ?\nAdminን ያናግሩ: {SUPPORT_USERNAME}\nቻናል: {CHANNEL_URL}"
+    text = t["support_text"].format(channel=CHANNEL_URL)
     return text, keyboard
 
 # --- Core Command Handlers ---
@@ -356,6 +377,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/cancel - leaves any screenshot / payment / receipt step and shows the menu."""
     lang = get_lang(update.effective_user.id)
     context.user_data.pop("pending_receipt_user", None)
+    context.user_data.pop("reply_target", None)
     await update.message.reply_text(TEXTS[lang]["cancelled"], reply_markup=main_menu(lang))
     return ConversationHandler.END
 
@@ -609,6 +631,159 @@ async def receive_admin_receipt(update: Update, context: ContextTypes.DEFAULT_TY
     context.user_data.pop("pending_receipt_user", None)
     return ConversationHandler.END
 
+# --- Contact Admin Through the Bot ---
+def admin_reply_keyboard(user_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✍️ Reply", callback_data=f"adm_reply_{user_id}")]
+    ])
+
+def user_reply_keyboard(lang):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(TEXTS[lang]["btn_reply_admin"], callback_data="contact_admin")]
+    ])
+
+def user_header_html(user, lang, title):
+    name = html.escape(user.full_name or "Unknown")
+    username = f"@{html.escape(user.username)}" if user.username else "no username"
+    return (
+        f"{title}\n\n"
+        f"👤 <b>User:</b> <a href=\"tg://user?id={user.id}\">{name}</a> ({username})\n"
+        f"🆔 <b>ID:</b> <code>{user.id}</code>\n"
+        f"🌐 <b>Lang:</b> {lang.upper()}"
+    )
+
+async def contact_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """'Message the Admin' button or /contact - tells the user to type their message."""
+    lang = get_lang(update.effective_user.id)
+    if update.callback_query:
+        await update.callback_query.answer()
+        target = update.callback_query.message
+    else:
+        target = update.message
+    await target.reply_text(
+        TEXTS[lang]["contact_prompt"],
+        parse_mode="Markdown",
+        reply_markup=back_main(lang),
+    )
+
+async def request_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """One-tap 'Get Gmail Task' request: notifies the admin, who then replies from the bot."""
+    query = update.callback_query
+    user = query.from_user
+    lang = get_lang(user.id)
+    now = time.time()
+
+    if now - context.user_data.get("last_task_request", 0) < TASK_COOLDOWN:
+        await query.answer(TEXTS[lang]["task_already"], show_alert=True)
+        return
+
+    await query.answer()
+    try:
+        text = (
+            user_header_html(user, lang, "🆕 <b>GMAIL TASK REQUEST</b>")
+            + "\n\nThis user wants a Gmail task. Tap <b>Reply</b> to send the account details."
+        )
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=admin_reply_keyboard(user.id),
+        )
+    except Exception as e:
+        print(f"Failed to send task request to admin: {e}")
+        await query.message.reply_text(TEXTS[lang]["contact_failed"].format(support=SUPPORT_USERNAME))
+        return
+
+    context.user_data["last_task_request"] = now
+    after_keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(TEXTS[lang]["btn_submit_ss"], callback_data="start_submit_screenshot")],
+        [InlineKeyboardButton(TEXTS[lang]["btn_back"], callback_data="main_menu")],
+    ])
+    await query.edit_message_text(
+        TEXTS[lang]["task_request_sent"],
+        parse_mode="Markdown",
+        reply_markup=after_keyboard,
+    )
+
+async def receive_contact_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Any normal message a customer sends to the bot -> forwarded to the admin + auto-reply."""
+    user = update.effective_user
+    msg = update.message
+    lang = get_lang(user.id)
+
+    try:
+        header = user_header_html(user, lang, "📩 <b>NEW MESSAGE FROM USER</b>")
+        if msg.text:
+            body = html.escape(msg.text[:3500])
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=f"{header}\n\n💬 {body}",
+                parse_mode="HTML",
+                reply_markup=admin_reply_keyboard(user.id),
+            )
+        else:
+            # photos, voice notes, documents, etc.
+            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=header, parse_mode="HTML")
+            await context.bot.copy_message(
+                chat_id=ADMIN_CHAT_ID,
+                from_chat_id=msg.chat_id,
+                message_id=msg.message_id,
+                reply_markup=admin_reply_keyboard(user.id),
+            )
+    except Exception as e:
+        print(f"Failed to forward user message to admin: {e}")
+        await msg.reply_text(TEXTS[lang]["contact_failed"].format(support=SUPPORT_USERNAME))
+        return
+
+    # Full auto-reply the first time (or after a quiet period), short confirmation otherwise
+    now = time.time()
+    last_ack = context.user_data.get("last_ack", 0)
+    context.user_data["last_ack"] = now
+    if now - last_ack > ACK_WINDOW:
+        await msg.reply_text(TEXTS[lang]["contact_ack"], parse_mode="Markdown", reply_markup=back_main(lang))
+    else:
+        await msg.reply_text(TEXTS[lang]["contact_sent_short"])
+
+async def start_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin taps '✍️ Reply' under a user's message."""
+    query = update.callback_query
+    await query.answer()
+
+    if query.from_user.id != ADMIN_CHAT_ID:
+        return ConversationHandler.END
+
+    target_user_id = int(query.data.split("_")[2])
+    context.user_data["reply_target"] = target_user_id
+    await query.message.reply_text(
+        f"✍️ Type your reply for user ID {target_user_id} now (text, photo, voice...).\nSend /cancel to stop."
+    )
+    return WAITING_ADMIN_REPLY
+
+async def send_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Delivers the admin's next message to the user, with a Reply button for them."""
+    target_user_id = context.user_data.pop("reply_target", None)
+    if not target_user_id:
+        await update.message.reply_text("⚠️ No user selected. Tap ✍️ Reply under a user's message first.")
+        return ConversationHandler.END
+
+    target_lang = get_lang(target_user_id)
+    try:
+        await context.bot.send_message(
+            chat_id=target_user_id,
+            text=TEXTS[target_lang]["admin_reply_header"],
+            parse_mode="Markdown",
+        )
+        await context.bot.copy_message(
+            chat_id=target_user_id,
+            from_chat_id=update.effective_chat.id,
+            message_id=update.message.message_id,
+            reply_markup=user_reply_keyboard(target_lang),
+        )
+        await update.message.reply_text(f"✅ Reply delivered to user (ID: {target_user_id}).")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to deliver reply to user {target_user_id}: {e}")
+    return ConversationHandler.END
+
 # --- Error Handler (so problems show up in your logs instead of failing silently) ---
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     print(f"Error while handling an update: {context.error}")
@@ -624,6 +799,7 @@ async def post_init(application: Application):
         BotCommand("requirements", "Requirements & rules"),
         BotCommand("faq", "Frequently asked questions"),
         BotCommand("support", "Contact support"),
+        BotCommand("contact", "Message the Admin"),
         BotCommand("language", "Switch language / ቋንቋ ቀይር"),
         BotCommand("cancel", "Cancel the current step"),
     ])
@@ -674,9 +850,19 @@ if __name__ == "__main__":
         allow_reentry=True,
     )
 
+    admin_reply_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_admin_reply, pattern="^adm_reply_")],
+        states={
+            WAITING_ADMIN_REPLY: [MessageHandler(~filters.COMMAND, send_admin_reply)],
+        },
+        fallbacks=conversation_fallbacks,
+        allow_reentry=True,
+    )
+
     app.add_handler(screenshot_conv)
     app.add_handler(payment_conv)
     app.add_handler(receipt_conv)
+    app.add_handler(admin_reply_conv)
 
     # Typed commands
     app.add_handler(CommandHandler(["start", "menu", "help"], start))
@@ -688,11 +874,25 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("faq", cmd_faq))
     app.add_handler(CommandHandler(["task", "gettask"], cmd_task))
     app.add_handler(CommandHandler("support", cmd_support))
+    app.add_handler(CommandHandler("contact", contact_prompt))
     app.add_handler(CommandHandler("cancel", cancel))
 
     # Button callbacks
+    app.add_handler(CallbackQueryHandler(request_task, pattern="^request_task$"))
+    app.add_handler(CallbackQueryHandler(contact_prompt, pattern="^contact_admin$"))
     app.add_handler(CallbackQueryHandler(admin_decision, pattern="^adm_approve_|^adm_reject_"))
     app.add_handler(CallbackQueryHandler(buttons))
+
+    # Catch-all (must stay LAST): any normal private message from a customer goes to the admin.
+    # The admin's own messages are excluded so they are never forwarded back to themselves.
+    app.add_handler(MessageHandler(
+        filters.UpdateType.MESSAGE
+        & filters.ChatType.PRIVATE
+        & ~filters.COMMAND
+        & ~filters.StatusUpdate.ALL
+        & ~filters.User(user_id=ADMIN_CHAT_ID),
+        receive_contact_message,
+    ))
 
     app.add_error_handler(error_handler)
 
