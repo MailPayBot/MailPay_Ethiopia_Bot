@@ -8,7 +8,14 @@ import time
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
-from telegram import BotCommand, BotCommandScopeChat, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand,
+    BotCommandScopeChat,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+    WebAppInfo,
+)
 from telegram.error import BadRequest, RetryAfter
 from telegram.ext import (
     Application,
@@ -934,6 +941,14 @@ def panel_keyboard():
         [
             InlineKeyboardButton("📢 Broadcast", callback_data="adm_bc"),
             InlineKeyboardButton("📤 Export CSV", callback_data="adm_export"),
+        ],
+        [
+            InlineKeyboardButton(
+                "📋 Mini App Tasks & Withdrawals",
+                web_app=WebAppInfo(
+                    url="https://mailpay-et-miniapp.onrender.com/admin"
+                ),
+            ),
         ],
     ])
 
