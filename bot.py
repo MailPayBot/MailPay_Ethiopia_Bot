@@ -445,7 +445,6 @@ def main_menu(lang="en"):
     t = TEXTS[lang]
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(t["btn_get_task"], callback_data="get_task")],
-        [InlineKeyboardButton(t["btn_submit_ss"], callback_data="start_submit_screenshot")],
         [
             InlineKeyboardButton(t["btn_how"], callback_data="how_it_works"),
             InlineKeyboardButton(t["btn_pay"], callback_data="payment_info"),
