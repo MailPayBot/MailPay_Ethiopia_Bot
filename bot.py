@@ -13,6 +13,7 @@ from telegram import (
     BotCommandScopeChat,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ReplyKeyboardRemove,
     Update,
     WebAppInfo,
 )
@@ -513,10 +514,23 @@ def support_content(lang):
     return text, keyboard
 
 # --- Core Command Handlers ---
+async def send_main_menu_after_keyboard_cleanup(message, lang, text=None):
+    """Remove any legacy persistent reply keyboard, then show the current inline menu."""
+    menu_message = await message.reply_text(
+        text or TEXTS[lang]["welcome"],
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    # ReplyKeyboardRemove must be sent as its own reply markup. We then attach
+    # the current inline menu to the same message so the old keyboard stays gone.
+    await menu_message.edit_reply_markup(reply_markup=main_menu(lang))
+    return menu_message
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     lang = get_lang(user_id)
-    await update.message.reply_text(TEXTS[lang]["welcome"], reply_markup=main_menu(lang))
+    await send_main_menu_after_keyboard_cleanup(update.message, lang)
+
 
 async def set_language_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -524,7 +538,7 @@ async def set_language_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_lang = "am" if current_lang == "en" else "en"
     await set_lang(user_id, new_lang)
     msg = "🌐 Language changed to English!" if new_lang == "en" else "🌐 ቋንቋ ወደ አማርኛ ተቀይሯል!"
-    await update.message.reply_text(msg, reply_markup=main_menu(new_lang))
+    await send_main_menu_after_keyboard_cleanup(update.message, new_lang, text=msg)
 
 # --- Typed Slash Commands (/howitworks, /payment, /requirements, ...) ---
 def make_text_command(text_key):
