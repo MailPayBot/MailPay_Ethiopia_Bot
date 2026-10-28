@@ -191,11 +191,13 @@ def init_db():
             amount INTEGER NOT NULL CHECK (amount >= 50), method TEXT NOT NULL, payment_details TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','paid','rejected')),
             requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), decided_at TIMESTAMPTZ, admin_note TEXT,
-            receipt_image_data TEXT, payment_account_name TEXT, payment_account_number TEXT, custom_payment_method TEXT)""")
+            receipt_image_data TEXT, payment_account_name TEXT, payment_account_number TEXT,
+            custom_payment_method TEXT, request_source TEXT NOT NULL DEFAULT 'miniapp')""")
         _run("ALTER TABLE public.mp_tasks ADD COLUMN IF NOT EXISTS telegram_username TEXT")
         _run("ALTER TABLE public.mp_tasks ADD COLUMN IF NOT EXISTS telegram_first_name TEXT")
         _run("ALTER TABLE public.mp_tasks ADD COLUMN IF NOT EXISTS telegram_last_name TEXT")
         _run("ALTER TABLE public.mp_tasks ADD COLUMN IF NOT EXISTS request_source TEXT NOT NULL DEFAULT 'miniapp'")
+        _run("ALTER TABLE public.mp_withdrawals ADD COLUMN IF NOT EXISTS request_source TEXT NOT NULL DEFAULT 'miniapp'")
         _run("CREATE INDEX IF NOT EXISTS mp_tasks_user_idx ON public.mp_tasks(user_id, requested_at DESC)")
         _run("CREATE INDEX IF NOT EXISTS mp_tasks_status_idx ON public.mp_tasks(status, requested_at)")
         _run("CREATE INDEX IF NOT EXISTS mp_ledger_user_idx ON public.mp_wallet_ledger(user_id, available_at)")
@@ -296,8 +298,8 @@ def _create_shared_withdrawal(user_id, amount, method, account_name, account_num
             return {"error":"The withdrawal amount exceeds your available balance."}
         details = f"Account name: {account_name}\nAccount number: {account_number}"
         cur.execute("""INSERT INTO public.mp_withdrawals
-                       (user_id,amount,method,payment_details,payment_account_name,payment_account_number)
-                       VALUES(%s,%s,%s,%s,%s,%s) RETURNING id,amount,method,status""",
+                       (user_id,amount,method,payment_details,payment_account_name,payment_account_number,request_source)
+                       VALUES(%s,%s,%s,%s,%s,%s,'telegram_bot') RETURNING id,amount,method,status""",
                     (user_id,amount,method,details,account_name,account_number))
         row = cur.fetchone()
         conn.commit()
@@ -663,7 +665,6 @@ def task_keyboard(lang, user_id=None):
 def wallet_keyboard(lang="en"):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("💸 Withdraw" if lang == "en" else "💸 ገንዘብ አውጣ", callback_data="wallet_withdraw")],
-        [InlineKeyboardButton("🔄 Refresh balance" if lang == "en" else "🔄 ሂሳብ አድስ", callback_data="wallet_refresh")],
         [InlineKeyboardButton("📑 My withdrawals" if lang == "en" else "📑 የማውጣት ታሪክ", callback_data="withdrawal_history")],
         [InlineKeyboardButton("📋 My tasks" if lang == "en" else "📋 ተግባሮቼ", callback_data="task_history")],
         [InlineKeyboardButton("🏠 Main menu" if lang == "en" else "🏠 ዋና ማውጫ", callback_data="main_menu")],
@@ -993,7 +994,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=task_keyboard(lang, user_id),
         )
 
-    elif data in ("wallet_view", "wallet_refresh"):
+    elif data == "wallet_view":
         try:
             await query.edit_message_text(await wallet_message(user_id, lang), reply_markup=wallet_keyboard(lang))
         except Exception as e:
