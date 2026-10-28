@@ -664,6 +664,7 @@ def wallet_keyboard(lang="en"):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("💸 Withdraw" if lang == "en" else "💸 ገንዘብ አውጣ", callback_data="wallet_withdraw")],
         [InlineKeyboardButton("🔄 Refresh balance" if lang == "en" else "🔄 ሂሳብ አድስ", callback_data="wallet_refresh")],
+        [InlineKeyboardButton("📑 My withdrawals" if lang == "en" else "📑 የማውጣት ታሪክ", callback_data="withdrawal_history")],
         [InlineKeyboardButton("📋 My tasks" if lang == "en" else "📋 ተግባሮቼ", callback_data="task_history")],
         [InlineKeyboardButton("🏠 Main menu" if lang == "en" else "🏠 ዋና ማውጫ", callback_data="main_menu")],
     ])
@@ -725,6 +726,36 @@ async def cmd_my_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         print(f"Task history lookup failed: {e}")
         await update.message.reply_text("Your shared task history is temporarily unavailable. Please try again later.")
+
+async def withdrawal_history_message(user_id, lang="en"):
+    if not USE_PG:
+        raise RuntimeError("The shared withdrawal history requires the connected database.")
+    rows = await db("""
+        SELECT id, amount, method, status,
+               to_char(requested_at AT TIME ZONE 'Africa/Addis_Ababa', 'YYYY-MM-DD HH24:MI') AS requested_local,
+               admin_note
+        FROM public.mp_withdrawals
+        WHERE user_id = ?
+        ORDER BY requested_at DESC LIMIT 10
+    """, (user_id,), "all")
+    title = "📑 YOUR WITHDRAWALS" if lang == "en" else "📑 የማውጣት ታሪክዎ"
+    if not rows:
+        return title + ("\n\nYou have no withdrawal requests yet." if lang == "en" else "\n\nእስካሁን የማውጣት ጥያቄ የለዎትም።")
+    lines = [title]
+    for row in rows:
+        line = f"\n\nWithdrawal #{row['id']} · {row['amount']} ETB\nMethod: {row['method']}\nStatus: {str(row['status']).upper()}\nRequested: {row.get('requested_local') or 'recently'}"
+        if row.get("admin_note"):
+            line += f"\nAdmin note: {row['admin_note'][:250]}"
+        lines.append(line)
+    return "\n".join(lines)
+
+async def cmd_withdrawal_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(update.effective_user.id)
+    try:
+        await update.message.reply_text(await withdrawal_history_message(update.effective_user.id, lang), reply_markup=wallet_keyboard(lang))
+    except Exception as e:
+        print(f"Withdrawal history lookup failed: {e}")
+        await update.message.reply_text("Your withdrawal history is temporarily unavailable. Please try again later.")
 
 
 # ---- Shared wallet withdrawals ----
@@ -968,6 +999,13 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             print(f"Wallet view failed: {e}")
             await query.edit_message_text("The shared wallet is temporarily unavailable. Please try again later.", reply_markup=back_main(lang))
+
+    elif data == "withdrawal_history":
+        try:
+            await query.edit_message_text(await withdrawal_history_message(user_id, lang), reply_markup=wallet_keyboard(lang))
+        except Exception as e:
+            print(f"Withdrawal history view failed: {e}")
+            await query.edit_message_text("Your withdrawal history is temporarily unavailable. Please try again later.", reply_markup=wallet_keyboard(lang))
 
     elif data in ("task_history", "task_history_refresh"):
         try:
@@ -1925,6 +1963,7 @@ async def post_init(application: Application):
         BotCommand("wallet", "View your shared balance"),
         BotCommand("mytasks", "View shared task history"),
         BotCommand("withdraw", "Request a withdrawal"),
+        BotCommand("withdrawals", "View withdrawal history"),
         BotCommand("submit", "Submit a screenshot"),
         BotCommand("howitworks", "How it works"),
         BotCommand("payment", "Payment info"),
@@ -2057,6 +2096,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler(["task", "gettask"], cmd_task))
     app.add_handler(CommandHandler("wallet", cmd_wallet))
     app.add_handler(CommandHandler("mytasks", cmd_my_tasks))
+    app.add_handler(CommandHandler("withdrawals", cmd_withdrawal_history))
     app.add_handler(CommandHandler("support", cmd_support))
     app.add_handler(CommandHandler("contact", contact_prompt))
     app.add_handler(CommandHandler("cancel", cancel))
