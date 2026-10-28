@@ -726,6 +726,135 @@ async def cmd_my_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"Task history lookup failed: {e}")
         await update.message.reply_text("Your shared task history is temporarily unavailable. Please try again later.")
 
+
+# ---- Shared wallet withdrawals ----
+async def start_withdrawal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        await query.answer()
+        user = query.from_user
+        target = query.message
+    else:
+        user = update.effective_user
+        target = update.message
+    lang = get_lang(user.id)
+    if not USE_PG:
+        await target.reply_text("The shared withdrawal system is temporarily unavailable. Please contact support.")
+        return ConversationHandler.END
+    try:
+        wallet = await get_shared_wallet(user.id)
+    except Exception as e:
+        print(f"Could not start withdrawal: {e}")
+        await target.reply_text("Could not load your shared balance. Please try again later.")
+        return ConversationHandler.END
+    if int(wallet["available"]) < 50:
+        await target.reply_text(
+            f"Your available balance is {wallet['available']} ETB. The minimum withdrawal is 50 ETB.",
+            reply_markup=wallet_keyboard(lang),
+        )
+        return ConversationHandler.END
+    for key in ("withdraw_amount", "withdraw_method", "withdraw_account_name"):
+        context.user_data.pop(key, None)
+    await target.reply_text(
+        f"💸 WITHDRAW FROM MAILPAY ET\n\nAvailable balance: {wallet['available']} ETB\nMinimum withdrawal: 50 ETB\n\nEnter the whole ETB amount you want to withdraw, or /cancel to stop."
+    )
+    return WAITING_WITHDRAW_AMOUNT
+
+async def receive_withdraw_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = (update.message.text or "").strip()
+    if not raw.isdigit():
+        await update.message.reply_text("Please enter a whole number, such as 50.")
+        return WAITING_WITHDRAW_AMOUNT
+    amount = int(raw)
+    try:
+        wallet = await get_shared_wallet(update.effective_user.id)
+    except Exception as e:
+        print(f"Could not validate withdrawal amount: {e}")
+        await update.message.reply_text("Could not check your balance. Please try again later.")
+        return ConversationHandler.END
+    if amount < 50:
+        await update.message.reply_text("The minimum withdrawal is 50 ETB. Enter another amount.")
+        return WAITING_WITHDRAW_AMOUNT
+    if amount > int(wallet["available"]):
+        await update.message.reply_text(f"Your available balance is {wallet['available']} ETB. Enter an amount no higher than your balance.")
+        return WAITING_WITHDRAW_AMOUNT
+    context.user_data["withdraw_amount"] = amount
+    await update.message.reply_text(
+        f"Choose a payout method for {amount} ETB:",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Telebirr", callback_data="withdraw_method_Telebirr")],
+            [InlineKeyboardButton("M-Pesa", callback_data="withdraw_method_M-Pesa")],
+            [InlineKeyboardButton("Commercial Bank of Ethiopia (CBE)", callback_data="withdraw_method_CBE")],
+        ]),
+    )
+    return WAITING_WITHDRAW_METHOD
+
+async def receive_withdraw_method(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    method = query.data.replace("withdraw_method_", "", 1)
+    if method not in ("Telebirr", "M-Pesa", "CBE"):
+        await query.message.reply_text("Please choose Telebirr, M-Pesa, or CBE.")
+        return WAITING_WITHDRAW_METHOD
+    context.user_data["withdraw_method"] = method
+    await query.message.reply_text(f"Enter the full account name for {method}.")
+    return WAITING_WITHDRAW_NAME
+
+async def receive_withdraw_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = (update.message.text or "").strip()
+    if not name or len(name) > 160:
+        await update.message.reply_text("Enter a valid full account name (up to 160 characters).")
+        return WAITING_WITHDRAW_NAME
+    context.user_data["withdraw_account_name"] = name
+    await update.message.reply_text("Now enter the Telebirr, M-Pesa, or CBE account number.")
+    return WAITING_WITHDRAW_ACCOUNT
+
+async def receive_withdraw_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    account_number = (update.message.text or "").strip()
+    if not account_number or len(account_number) > 100:
+        await update.message.reply_text("Enter a valid account number (up to 100 characters).")
+        return WAITING_WITHDRAW_ACCOUNT
+    user = update.effective_user
+    amount = int(context.user_data.get("withdraw_amount") or 0)
+    method = context.user_data.get("withdraw_method")
+    name = context.user_data.get("withdraw_account_name")
+    if not amount or method not in ("Telebirr", "M-Pesa", "CBE") or not name:
+        await update.message.reply_text("Your withdrawal details expired. Please start again from My balance.")
+        return ConversationHandler.END
+    try:
+        result = await asyncio.to_thread(_create_shared_withdrawal, user.id, amount, method, name, account_number)
+        if result.get("error"):
+            await update.message.reply_text(result["error"], reply_markup=wallet_keyboard(get_lang(user.id)))
+            return ConversationHandler.END
+    except Exception as e:
+        print(f"Shared withdrawal request failed: {e}")
+        await update.message.reply_text("Could not save your withdrawal request. Please try again later.")
+        return ConversationHandler.END
+
+    for key in ("withdraw_amount", "withdraw_method", "withdraw_account_name"):
+        context.user_data.pop(key, None)
+    if ADMIN_CHAT_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=(f"💸 NEW SHARED WITHDRAWAL #{result['id']}\n\n"
+                      f"Customer: {user.full_name} (@{user.username or 'no username'})\n"
+                      f"Telegram ID: {user.id}\nAmount: {result['amount']} ETB\nMethod: {method}\n"
+                      f"Account name: {name}\nAccount number: {account_number}\n\n"
+                      "Review it in the unified MailPay ET admin panel."),
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("Open unified admin panel", web_app=WebAppInfo(url="https://mailpay-et-miniapp.onrender.com/admin"))
+                ]]),
+            )
+        except Exception as e:
+            print(f"Withdrawal saved but admin notification failed: {e}")
+    await update.message.reply_text(
+        f"✅ Withdrawal request #{result['id']} for {amount} ETB was submitted. Your balance is now shared across the bot and Mini App. Check your withdrawal status in the Mini App or contact support.",
+        reply_markup=main_menu(get_lang(user.id)),
+    )
+    return ConversationHandler.END
+
+
 def support_content(lang):
     t = TEXTS[lang]
     keyboard = InlineKeyboardMarkup([
@@ -1793,6 +1922,9 @@ async def post_init(application: Application):
     commands = [
         BotCommand("start", "Open the main menu"),
         BotCommand("task", "Get a Gmail task"),
+        BotCommand("wallet", "View your shared balance"),
+        BotCommand("mytasks", "View shared task history"),
+        BotCommand("withdraw", "Request a withdrawal"),
         BotCommand("submit", "Submit a screenshot"),
         BotCommand("howitworks", "How it works"),
         BotCommand("payment", "Payment info"),
@@ -1849,6 +1981,21 @@ if __name__ == "__main__":
         allow_reentry=True,
     )
 
+    withdrawal_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(start_withdrawal, pattern="^wallet_withdraw$"),
+            CommandHandler("withdraw", start_withdrawal),
+        ],
+        states={
+            WAITING_WITHDRAW_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_withdraw_amount)],
+            WAITING_WITHDRAW_METHOD: [CallbackQueryHandler(receive_withdraw_method, pattern=r"^withdraw_method_(Telebirr|M-Pesa|CBE)$")],
+            WAITING_WITHDRAW_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_withdraw_name)],
+            WAITING_WITHDRAW_ACCOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_withdraw_account)],
+        },
+        fallbacks=conversation_fallbacks,
+        allow_reentry=True,
+    )
+
     receipt_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(start_receipt_upload, pattern=r"^adm_receipt_\d+$")],
         states={
@@ -1893,6 +2040,7 @@ if __name__ == "__main__":
 
     app.add_handler(screenshot_conv)
     app.add_handler(payment_conv)
+    app.add_handler(withdrawal_conv)
     app.add_handler(receipt_conv)
     app.add_handler(admin_reply_conv)
     app.add_handler(find_conv)
@@ -1907,6 +2055,8 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler(["requirements", "requirement", "requirments", "rules"], cmd_requirements))
     app.add_handler(CommandHandler("faq", cmd_faq))
     app.add_handler(CommandHandler(["task", "gettask"], cmd_task))
+    app.add_handler(CommandHandler("wallet", cmd_wallet))
+    app.add_handler(CommandHandler("mytasks", cmd_my_tasks))
     app.add_handler(CommandHandler("support", cmd_support))
     app.add_handler(CommandHandler("contact", contact_prompt))
     app.add_handler(CommandHandler("cancel", cancel))
