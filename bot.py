@@ -273,7 +273,7 @@ async def list_shared_tasks(user_id, limit=8):
                 WHERE user_id=? AND status='assigned' AND expires_at IS NOT NULL AND expires_at<=NOW()""", (user_id,))
     return await db("""SELECT id,status,instructions,reward_etb,
                         to_char(requested_at AT TIME ZONE 'Africa/Addis_Ababa','YYYY-MM-DD HH24:MI') AS requested_local,
-                        to_char(expires_at AT TIME ZONE 'Africa/Addis_Addis','YYYY-MM-DD HH24:MI') AS expires_local
+                        to_char(expires_at AT TIME ZONE 'Africa/Addis_Ababa','YYYY-MM-DD HH24:MI') AS expires_local
                      FROM public.mp_tasks WHERE user_id=? ORDER BY requested_at DESC LIMIT ?""", (user_id,limit), "all")
 
 def _create_shared_withdrawal(user_id, amount, method, account_name, account_number):
@@ -386,6 +386,11 @@ async def track_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             (user.id, user.username, name, get_lang(user.id), now, now),
         )
         _SEEN[user.id] = (user.username, name, now)
+        if USE_PG:
+            try:
+                await ensure_shared_wallet(user.id)
+            except Exception as wallet_error:
+                print(f"Failed to initialize shared wallet for {user.id}: {wallet_error}")
     except Exception as e:
         print(f"Failed to track user: {e}")
 
@@ -594,6 +599,10 @@ def main_menu(lang="en"):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(t["btn_get_task"], callback_data="get_task")],
         [
+            InlineKeyboardButton("💰 My balance" if lang == "en" else "💰 ቀሪ ሂሳቤ", callback_data="wallet_view"),
+            InlineKeyboardButton("📋 My tasks" if lang == "en" else "📋 ተግባሮቼ", callback_data="task_history"),
+        ],
+        [
             InlineKeyboardButton(t["btn_how"], callback_data="how_it_works"),
             InlineKeyboardButton(t["btn_pay"], callback_data="payment_info"),
         ],
@@ -645,10 +654,77 @@ def faq_back(lang="en"):
 def task_keyboard(lang, user_id=None):
     t = TEXTS[lang]
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(t["btn_contact_admin"], callback_data="request_task")],
+        [InlineKeyboardButton("📝 Request a task" if lang == "en" else "📝 ተግባር ይጠይቁ", callback_data="request_task")],
         [InlineKeyboardButton(t["btn_submit_ss"], callback_data="start_submit_screenshot")],
+        [InlineKeyboardButton("📋 My tasks" if lang == "en" else "📋 ተግባሮቼ", callback_data="task_history")],
         [InlineKeyboardButton(t["btn_back"], callback_data="main_menu")],
     ])
+
+def wallet_keyboard(lang="en"):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💸 Withdraw" if lang == "en" else "💸 ገንዘብ አውጣ", callback_data="wallet_withdraw")],
+        [InlineKeyboardButton("🔄 Refresh balance" if lang == "en" else "🔄 ሂሳብ አድስ", callback_data="wallet_refresh")],
+        [InlineKeyboardButton("📋 My tasks" if lang == "en" else "📋 ተግባሮቼ", callback_data="task_history")],
+        [InlineKeyboardButton("🏠 Main menu" if lang == "en" else "🏠 ዋና ማውጫ", callback_data="main_menu")],
+    ])
+
+def task_history_keyboard(lang="en"):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📝 Request a task" if lang == "en" else "📝 ተግባር ይጠይቁ", callback_data="get_task")],
+        [InlineKeyboardButton("💰 My balance" if lang == "en" else "💰 ቀሪ ሂሳቤ", callback_data="wallet_view")],
+        [InlineKeyboardButton("🔄 Refresh tasks" if lang == "en" else "🔄 ተግባሮችን አድስ", callback_data="task_history_refresh")],
+        [InlineKeyboardButton("🏠 Main menu" if lang == "en" else "🏠 ዋና ማውጫ", callback_data="main_menu")],
+    ])
+
+async def wallet_message(user_id, lang="en"):
+    wallet = await get_shared_wallet(user_id)
+    if lang == "am":
+        return ("💰 የMAILPAY ET የኪስ ቦርሳ\n\n"
+                f"የሚገኝ ሂሳብ: {wallet['available']} ETB\n"
+                f"ጠቅላላ ገቢ: {wallet['total_earned']} ETB\n"
+                f"በጊዜ ገደብ ላይ ያለ ሽልማት: {wallet['pending_rewards']} ETB\n"
+                f"በሂደት ላይ ያለ የማውጣት ጥያቄ: {wallet['pending_withdrawals']} ETB\n\n"
+                "አንድ ጊዜ ብቻ 10 ETB የእንኳን ደህና መጡ ቦነስ ይሰጣል። ይህ ሂሳብ በBot እና Mini App መካከል የጋራ ነው።\n"
+                "ዝቅተኛ የማውጣት መጠን: 50 ETB")
+    return ("💰 MAILPAY ET WALLET\n\n"
+            f"Available balance: {wallet['available']} ETB\n"
+            f"Total earned: {wallet['total_earned']} ETB\n"
+            f"Pending rewards (72-hour hold): {wallet['pending_rewards']} ETB\n"
+            f"Pending withdrawals: {wallet['pending_withdrawals']} ETB\n\n"
+            "🎁 New customers receive a one-time 10 ETB welcome bonus. Your wallet is shared by the Bot and Mini App.\n"
+            "Minimum withdrawal: 50 ETB")
+
+async def task_history_message(user_id, lang="en"):
+    items = await list_shared_tasks(user_id)
+    title = "📋 YOUR MAILPAY ET TASKS" if lang == "en" else "📋 የMAILPAY ET ተግባሮችዎ"
+    if not items:
+        return title + ("\n\nYou have no task requests yet." if lang == "en" else "\n\nእስካሁን የተግባር ጥያቄ የለዎትም።")
+    lines = [title]
+    for item in items:
+        line = f"\n\n#{item['id']} · {str(item['status']).upper()} · Requested {item.get('requested_local') or 'recently'}"
+        if item.get("instructions"):
+            line += f"\nInstructions: {item['instructions'][:700]}"
+            if item.get("expires_local") and item["status"] == "assigned":
+                line += f"\nDeadline (EAT): {item['expires_local']}"
+            line += f"\nReward: {item.get('reward_etb', 0)} ETB"
+        lines.append(line)
+    return "\n".join(lines)
+
+async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(update.effective_user.id)
+    try:
+        await update.message.reply_text(await wallet_message(update.effective_user.id, lang), reply_markup=wallet_keyboard(lang))
+    except Exception as e:
+        print(f"Wallet lookup failed: {e}")
+        await update.message.reply_text("The shared wallet is temporarily unavailable. Please try again later.")
+
+async def cmd_my_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(update.effective_user.id)
+    try:
+        await update.message.reply_text(await task_history_message(update.effective_user.id, lang), reply_markup=task_history_keyboard(lang))
+    except Exception as e:
+        print(f"Task history lookup failed: {e}")
+        await update.message.reply_text("Your shared task history is temporarily unavailable. Please try again later.")
 
 def support_content(lang):
     t = TEXTS[lang]
@@ -756,6 +832,20 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
             reply_markup=task_keyboard(lang, user_id),
         )
+
+    elif data in ("wallet_view", "wallet_refresh"):
+        try:
+            await query.edit_message_text(await wallet_message(user_id, lang), reply_markup=wallet_keyboard(lang))
+        except Exception as e:
+            print(f"Wallet view failed: {e}")
+            await query.edit_message_text("The shared wallet is temporarily unavailable. Please try again later.", reply_markup=back_main(lang))
+
+    elif data in ("task_history", "task_history_refresh"):
+        try:
+            await query.edit_message_text(await task_history_message(user_id, lang), reply_markup=task_history_keyboard(lang))
+        except Exception as e:
+            print(f"Shared task history failed: {e}")
+            await query.edit_message_text("Your shared task history is temporarily unavailable. Please try again later.", reply_markup=back_main(lang))
 
     elif data == "how_it_works":
         await query.edit_message_text(t["how_it_works"], reply_markup=back_main(lang))
