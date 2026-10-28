@@ -515,15 +515,17 @@ def support_content(lang):
 
 # --- Core Command Handlers ---
 async def send_main_menu_after_keyboard_cleanup(message, lang, text=None):
-    """Remove any legacy persistent reply keyboard, then show the current inline menu."""
-    menu_message = await message.reply_text(
-        text or TEXTS[lang]["welcome"],
+    """Clear any legacy persistent reply keyboard, then send the current inline menu."""
+    await message.reply_text(
+        "✅ Menu refreshed.",
         reply_markup=ReplyKeyboardRemove(),
     )
-    # ReplyKeyboardRemove must be sent as its own reply markup. We then attach
-    # the current inline menu to the same message so the old keyboard stays gone.
-    await menu_message.edit_reply_markup(reply_markup=main_menu(lang))
-    return menu_message
+    # Telegram keyboard removal and inline keyboards use different markup types,
+    # so send the actual menu as a separate message.
+    return await message.reply_text(
+        text or TEXTS[lang]["welcome"],
+        reply_markup=main_menu(lang),
+    )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
