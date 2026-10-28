@@ -1376,10 +1376,6 @@ def panel_keyboard():
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📊 Stats", callback_data="adm_stats"),
-            InlineKeyboardButton("⏳ Pending", callback_data="adm_pending"),
-        ],
-        [
-            InlineKeyboardButton("💸 Payouts", callback_data="adm_payouts"),
             InlineKeyboardButton("🔍 Find customer", callback_data="adm_find"),
         ],
         [
@@ -1388,7 +1384,7 @@ def panel_keyboard():
         ],
         [
             InlineKeyboardButton(
-                "📋 Mini App Tasks & Withdrawals",
+                "💸 Unified Tasks & Payouts",
                 web_app=WebAppInfo(
                     url="https://mailpay-et-miniapp.onrender.com/admin"
                 ),
