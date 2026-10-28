@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import csv
 import html
 import io
@@ -38,6 +39,10 @@ from telegram.ext import (
     WAITING_ADMIN_SEARCH,
     WAITING_BROADCAST,
 ) = range(6)
+WAITING_WITHDRAW_AMOUNT = 6
+WAITING_WITHDRAW_METHOD = 7
+WAITING_WITHDRAW_NAME = 8
+WAITING_WITHDRAW_ACCOUNT = 9
 
 PAY_PER_ACCOUNT = 10                      # ETB paid for each verified account
 EAT = timezone(timedelta(hours=3))        # Ethiopian time, used for dates in the admin panel
@@ -160,6 +165,148 @@ def init_db():
         decided_at BIGINT,
         paid_at BIGINT)""")
     _run("CREATE INDEX IF NOT EXISTS idx_sub_status ON submissions (status, payout_status)")
+
+    # Shared tables used by both the Telegram bot and the Mini App.
+    if USE_PG:
+        _run("""CREATE TABLE IF NOT EXISTS public.mp_wallet_accounts (
+            user_id BIGINT PRIMARY KEY,
+            welcome_bonus_granted BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
+        _run("""CREATE TABLE IF NOT EXISTS public.mp_wallet_ledger (
+            id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL, amount INTEGER NOT NULL,
+            entry_type TEXT NOT NULL, reference TEXT NOT NULL UNIQUE,
+            available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
+        _run("""CREATE TABLE IF NOT EXISTS public.mp_tasks (
+            id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'requested'
+              CHECK (status IN ('requested','assigned','submitted','approved','rejected','expired')),
+            instructions TEXT, reward_etb INTEGER NOT NULL DEFAULT 0 CHECK (reward_etb >= 0),
+            assigned_at TIMESTAMPTZ, expires_at TIMESTAMPTZ,
+            evidence_text TEXT, evidence_image_data TEXT,
+            requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), submitted_at TIMESTAMPTZ, decided_at TIMESTAMPTZ,
+            telegram_username TEXT, telegram_first_name TEXT, telegram_last_name TEXT,
+            request_source TEXT NOT NULL DEFAULT 'miniapp')""")
+        _run("""CREATE TABLE IF NOT EXISTS public.mp_withdrawals (
+            id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL,
+            amount INTEGER NOT NULL CHECK (amount >= 50), method TEXT NOT NULL, payment_details TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','paid','rejected')),
+            requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), decided_at TIMESTAMPTZ, admin_note TEXT,
+            receipt_image_data TEXT, payment_account_name TEXT, payment_account_number TEXT, custom_payment_method TEXT)""")
+        _run("ALTER TABLE public.mp_tasks ADD COLUMN IF NOT EXISTS telegram_username TEXT")
+        _run("ALTER TABLE public.mp_tasks ADD COLUMN IF NOT EXISTS telegram_first_name TEXT")
+        _run("ALTER TABLE public.mp_tasks ADD COLUMN IF NOT EXISTS telegram_last_name TEXT")
+        _run("ALTER TABLE public.mp_tasks ADD COLUMN IF NOT EXISTS request_source TEXT NOT NULL DEFAULT 'miniapp'")
+        _run("CREATE INDEX IF NOT EXISTS mp_tasks_user_idx ON public.mp_tasks(user_id, requested_at DESC)")
+        _run("CREATE INDEX IF NOT EXISTS mp_tasks_status_idx ON public.mp_tasks(status, requested_at)")
+        _run("CREATE INDEX IF NOT EXISTS mp_ledger_user_idx ON public.mp_wallet_ledger(user_id, available_at)")
+        _run("CREATE INDEX IF NOT EXISTS mp_withdrawals_user_idx ON public.mp_withdrawals(user_id, requested_at DESC)")
+
+
+# ---- Shared MailPay ET task and wallet services ----
+async def ensure_shared_wallet(user_id):
+    if not USE_PG:
+        return
+    await db("""
+        WITH new_account AS (
+            INSERT INTO public.mp_wallet_accounts (user_id)
+            VALUES (?) ON CONFLICT (user_id) DO NOTHING RETURNING user_id
+        ),
+        new_bonus AS (
+            INSERT INTO public.mp_wallet_ledger (user_id, amount, entry_type, reference, available_at)
+            SELECT user_id, 10, 'welcome_bonus', 'welcome:' || user_id::text, NOW()
+            FROM new_account ON CONFLICT (reference) DO NOTHING RETURNING user_id
+        )
+        UPDATE public.mp_wallet_accounts SET welcome_bonus_granted = TRUE
+        WHERE user_id IN (SELECT user_id FROM new_bonus)
+    """, (user_id,))
+
+async def get_shared_wallet(user_id):
+    if not USE_PG:
+        raise RuntimeError("The shared wallet requires the connected MailPay ET database.")
+    await ensure_shared_wallet(user_id)
+    row = await db("""
+        SELECT
+          COALESCE((SELECT SUM(amount) FROM public.mp_wallet_ledger WHERE user_id = ? AND available_at <= NOW()), 0)::INTEGER AS total_earned,
+          COALESCE((SELECT SUM(amount) FROM public.mp_wallet_ledger WHERE user_id = ? AND available_at > NOW()), 0)::INTEGER AS pending_rewards,
+          COALESCE((SELECT SUM(amount) FROM public.mp_withdrawals WHERE user_id = ? AND status = 'pending'), 0)::INTEGER AS pending_withdrawals,
+          GREATEST(0,
+            COALESCE((SELECT SUM(amount) FROM public.mp_wallet_ledger WHERE user_id = ? AND available_at <= NOW()), 0)
+            - COALESCE((SELECT SUM(amount) FROM public.mp_withdrawals WHERE user_id = ? AND status IN ('pending','paid')), 0)
+          )::INTEGER AS available
+    """, (user_id, user_id, user_id, user_id, user_id), "one")
+    return row or {"available": 0, "total_earned": 0, "pending_rewards": 0, "pending_withdrawals": 0}
+
+def _create_shared_task_request(user):
+    if not USE_PG:
+        raise RuntimeError("The shared task system requires the connected MailPay ET database.")
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute("BEGIN")
+        cur.execute("SELECT pg_advisory_xact_lock(%s::bigint)", (int(user.id),))
+        cur.execute("""UPDATE public.mp_tasks SET status='expired'
+                       WHERE user_id=%s AND status='assigned' AND expires_at IS NOT NULL AND expires_at<=NOW()""", (int(user.id),))
+        cur.execute("""SELECT id,status FROM public.mp_tasks
+                       WHERE user_id=%s AND status IN ('requested','assigned','submitted')
+                       ORDER BY requested_at DESC LIMIT 1""", (int(user.id),))
+        active = cur.fetchone()
+        if active:
+            conn.commit()
+            return {"created": False, "id": active[0], "status": active[1]}
+        cur.execute("""INSERT INTO public.mp_tasks
+                       (user_id,telegram_username,telegram_first_name,telegram_last_name,request_source)
+                       VALUES (%s,%s,%s,%s,'telegram_bot') RETURNING id,status""",
+                    (int(user.id), user.username, user.first_name, user.last_name))
+        row = cur.fetchone()
+        conn.commit()
+        return {"created": True, "id": row[0], "status": row[1]}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+async def list_shared_tasks(user_id, limit=8):
+    if not USE_PG:
+        raise RuntimeError("The shared task system requires the connected MailPay ET database.")
+    await db("""UPDATE public.mp_tasks SET status='expired'
+                WHERE user_id=? AND status='assigned' AND expires_at IS NOT NULL AND expires_at<=NOW()""", (user_id,))
+    return await db("""SELECT id,status,instructions,reward_etb,
+                        to_char(requested_at AT TIME ZONE 'Africa/Addis_Ababa','YYYY-MM-DD HH24:MI') AS requested_local,
+                        to_char(expires_at AT TIME ZONE 'Africa/Addis_Addis','YYYY-MM-DD HH24:MI') AS expires_local
+                     FROM public.mp_tasks WHERE user_id=? ORDER BY requested_at DESC LIMIT ?""", (user_id,limit), "all")
+
+def _create_shared_withdrawal(user_id, amount, method, account_name, account_number):
+    if not USE_PG:
+        raise RuntimeError("The shared wallet requires the connected MailPay ET database.")
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute("BEGIN")
+        cur.execute("INSERT INTO public.mp_wallet_accounts(user_id) VALUES(%s) ON CONFLICT(user_id) DO NOTHING", (user_id,))
+        cur.execute("SELECT user_id FROM public.mp_wallet_accounts WHERE user_id=%s FOR UPDATE", (user_id,))
+        cur.execute("""SELECT COALESCE((SELECT SUM(amount) FROM public.mp_wallet_ledger WHERE user_id=%s AND available_at<=NOW()),0)
+                       - COALESCE((SELECT SUM(amount) FROM public.mp_withdrawals WHERE user_id=%s AND status IN ('pending','paid')),0)""", (user_id,user_id))
+        available = int(cur.fetchone()[0] or 0)
+        if available < 50:
+            conn.rollback()
+            return {"error":"Your available balance is below the 50 ETB minimum."}
+        if amount > available:
+            conn.rollback()
+            return {"error":"The withdrawal amount exceeds your available balance."}
+        details = f"Account name: {account_name}\nAccount number: {account_number}"
+        cur.execute("""INSERT INTO public.mp_withdrawals
+                       (user_id,amount,method,payment_details,payment_account_name,payment_account_number)
+                       VALUES(%s,%s,%s,%s,%s,%s) RETURNING id,amount,method,status""",
+                    (user_id,amount,method,details,account_name,account_number))
+        row = cur.fetchone()
+        conn.commit()
+        return {"id":row[0],"amount":row[1],"method":row[2],"status":row[3]}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 # --- small helpers used by the admin panel ---
