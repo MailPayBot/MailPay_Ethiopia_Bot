@@ -1116,33 +1116,6 @@ async def receive_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await update.message.reply_text("The shared task system is not connected. Please contact support.")
     return ConversationHandler.END
-    except Exception as e:
-        print(f"Failed to save submission: {e}")
-        await update.message.reply_text(TEXTS[lang]["contact_failed"].format(support=SUPPORT_USERNAME))
-        return ConversationHandler.END
-
-    if ADMIN_CHAT_ID:
-        try:
-            sub = {
-                "id": sub_id, "user_id": user.id, "username": user.username,
-                "full_name": user.full_name, "lang": lang, "created_at": now,
-            }
-            await context.bot.send_photo(
-                chat_id=ADMIN_CHAT_ID,
-                photo=photo_id,
-                caption=submission_caption(sub),
-                parse_mode="HTML",
-                reply_markup=decision_keyboard(sub_id),
-            )
-        except Exception as e:
-            print(f"Failed to forward screenshot to admin: {e}")
-
-    await update.message.reply_text(
-        TEXTS[lang]["screenshot_received"],
-        parse_mode="Markdown",
-        reply_markup=main_menu(lang),
-    )
-    return ConversationHandler.END
 
 
 # --- Shared admin message builders ---
