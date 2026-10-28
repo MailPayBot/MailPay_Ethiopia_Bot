@@ -891,13 +891,64 @@ async def receive_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE)
     photo_id = update.message.photo[-1].file_id
     now = int(time.time())
 
-    try:
-        row = await db(
-            "INSERT INTO submissions (user_id, photo_id, status, payout_status, amount, created_at) "
-            "VALUES (?, ?, 'pending', 'none', ?, ?) RETURNING id",
-            (user.id, photo_id, PAY_PER_ACCOUNT, now), "one",
-        )
-        sub_id = row["id"]
+    # Submit evidence against the shared assigned task so the Mini App and bot
+    # show one status, one screenshot and one reward.
+    if USE_PG:
+        try:
+            task = await db(
+                "SELECT id FROM public.mp_tasks WHERE user_id = ? AND status = 'assigned' "
+                "AND expires_at > NOW() ORDER BY assigned_at DESC LIMIT 1",
+                (user.id,), "one",
+            )
+            if not task:
+                await update.message.reply_text(
+                    "You don't have an assigned task awaiting proof. Request a task first, then submit your screenshot after the admin assigns it.",
+                    reply_markup=task_keyboard(lang, user.id),
+                )
+                return ConversationHandler.END
+
+            telegram_file = await update.message.photo[-1].get_file()
+            image_bytes = bytes(await telegram_file.download_as_bytearray())
+            if len(image_bytes) > 3000000:
+                await update.message.reply_text("That screenshot is larger than 3 MB. Please send a smaller image.")
+                return ConversationHandler.END
+            image_data = "data:image/jpeg;base64," + base64.b64encode(image_bytes).decode("ascii")
+            updated = await db(
+                "UPDATE public.mp_tasks SET status='submitted', evidence_image_data=?, submitted_at=NOW() "
+                "WHERE id=? AND user_id=? AND status='assigned' AND expires_at>NOW() RETURNING id",
+                (image_data, task["id"], user.id), "one",
+            )
+            if not updated:
+                await update.message.reply_text("This task has expired or was already submitted. Check My tasks for the latest status.")
+                return ConversationHandler.END
+
+            if ADMIN_CHAT_ID:
+                try:
+                    await context.bot.send_photo(
+                        chat_id=ADMIN_CHAT_ID,
+                        photo=photo_id,
+                        caption=(f"📥 MAILPAY ET — TASK #{task['id']} EVIDENCE SUBMITTED\n"
+                                 f"Customer: {user.full_name}\nTelegram ID: {user.id}\n"
+                                 "Evidence is also saved in the unified admin dashboard."),
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("Open unified admin panel", web_app=WebAppInfo(url="https://mailpay-et-miniapp.onrender.com/admin"))
+                        ]]),
+                    )
+                except Exception as notify_error:
+                    print(f"Could not notify admin about shared task evidence: {notify_error}")
+
+            await update.message.reply_text(
+                f"✅ Screenshot received for task #{task['id']}. Your task is now under review. Check My tasks or the Mini App for updates.",
+                reply_markup=main_menu(lang),
+            )
+            return ConversationHandler.END
+        except Exception as e:
+            print(f"Failed to save shared task evidence: {e}")
+            await update.message.reply_text("Could not submit your screenshot to the shared task system. Please try again or contact support.")
+            return ConversationHandler.END
+
+    await update.message.reply_text("The shared task system is not connected. Please contact support.")
+    return ConversationHandler.END
     except Exception as e:
         print(f"Failed to save submission: {e}")
         await update.message.reply_text(TEXTS[lang]["contact_failed"].format(support=SUPPORT_USERNAME))
@@ -1596,42 +1647,53 @@ async def contact_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def request_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """One-tap 'Get Gmail Task' request: notifies the admin, who then replies from the bot."""
+    """Create the same shared task request as the Mini App and notify the admin."""
     query = update.callback_query
     user = query.from_user
     lang = get_lang(user.id)
-    now = time.time()
-
-    if now - context.user_data.get("last_task_request", 0) < TASK_COOLDOWN:
-        await query.answer(TEXTS[lang]["task_already"], show_alert=True)
-        return
-
     await query.answer()
-    try:
-        text = (
-            user_header_html(user, lang, "🆕 <b>GMAIL TASK REQUEST</b>")
-            + "\n\nThis user wants a Gmail task. Tap <b>Reply</b> to send the account details."
+
+    if not USE_PG:
+        await query.message.reply_text(
+            "The shared task system is not connected. Please contact support.",
+            reply_markup=main_menu(lang),
         )
-        await context.bot.send_message(
-            chat_id=ADMIN_CHAT_ID,
-            text=text,
-            parse_mode="HTML",
-            reply_markup=admin_reply_keyboard(user.id),
-        )
-    except Exception as e:
-        print(f"Failed to send task request to admin: {e}")
-        await query.message.reply_text(TEXTS[lang]["contact_failed"].format(support=SUPPORT_USERNAME))
         return
 
-    context.user_data["last_task_request"] = now
-    after_keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(TEXTS[lang]["btn_submit_ss"], callback_data="start_submit_screenshot")],
-        [InlineKeyboardButton(TEXTS[lang]["btn_back"], callback_data="main_menu")],
-    ])
+    try:
+        await ensure_shared_wallet(user.id)
+        result = await asyncio.to_thread(_create_shared_task_request, user)
+    except Exception as e:
+        print(f"Failed to create shared task request: {e}")
+        await query.message.reply_text("Could not save your task request. Please try again later.")
+        return
+
+    if not result.get("created"):
+        await query.message.reply_text(
+            f"You already have active task #{result.get('id')} ({result.get('status')}). Check My tasks for instructions and status.",
+            reply_markup=task_history_keyboard(lang),
+        )
+        return
+
+    context.user_data["last_task_request"] = time.time()
+    if ADMIN_CHAT_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=(f"🆕 NEW SHARED MAILPAY ET TASK REQUEST #{result['id']}\n\n"
+                      f"👤 {user.full_name} (@{user.username or 'no username'})\n"
+                      f"🆔 Telegram ID: {user.id}\n\n"
+                      "This request is stored in the unified database and appears in the web admin panel."),
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("Open unified admin panel", web_app=WebAppInfo(url="https://mailpay-et-miniapp.onrender.com/admin"))
+                ]]),
+            )
+        except Exception as e:
+            print(f"Task saved but admin message could not be sent: {e}")
+
     await query.edit_message_text(
-        TEXTS[lang]["task_request_sent"],
-        parse_mode="Markdown",
-        reply_markup=after_keyboard,
+        f"✅ Your task request #{result['id']} has been saved. The admin will assign your instructions here and in the Mini App.\n\nYou can check its status from My tasks.",
+        reply_markup=task_history_keyboard(lang),
     )
 
 async def receive_contact_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
