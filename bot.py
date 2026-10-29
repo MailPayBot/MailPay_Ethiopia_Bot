@@ -875,7 +875,7 @@ async def receive_withdraw_account(update: Update, context: ContextTypes.DEFAULT
                       f"Account name: {name}\nAccount number: {account_number}\n\n"
                       "Review it in the unified MailPay ET admin panel."),
                 reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("Open unified admin panel", web_app=WebAppInfo(url="https://mailpay-et-miniapp.onrender.com/admin"))
+                    InlineKeyboardButton("Open unified admin panel", web_app=WebAppInfo(url="https://mailpay-et-miniapp-uqfa.onrender.com/admin"))
                 ]]),
             )
         except Exception as e:
@@ -1099,7 +1099,7 @@ async def receive_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE)
                                  f"Customer: {user.full_name}\nTelegram ID: {user.id}\n"
                                  "Evidence is also saved in the unified admin dashboard."),
                         reply_markup=InlineKeyboardMarkup([[
-                            InlineKeyboardButton("Open unified admin panel", web_app=WebAppInfo(url="https://mailpay-et-miniapp.onrender.com/admin"))
+                            InlineKeyboardButton("Open unified admin panel", web_app=WebAppInfo(url="https://mailpay-et-miniapp-uqfa.onrender.com/admin"))
                         ]]),
                     )
                 except Exception as notify_error:
@@ -1386,7 +1386,7 @@ def panel_keyboard():
             InlineKeyboardButton(
                 "💸 Unified Tasks & Payouts",
                 web_app=WebAppInfo(
-                    url="https://mailpay-et-miniapp.onrender.com/admin"
+                    url="https://mailpay-et-miniapp-uqfa.onrender.com/admin"
                 ),
             ),
         ],
@@ -1822,7 +1822,7 @@ async def request_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
                       f"🆔 Telegram ID: {user.id}\n\n"
                       "This request is stored in the unified database and appears in the web admin panel."),
                 reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("Open unified admin panel", web_app=WebAppInfo(url="https://mailpay-et-miniapp.onrender.com/admin"))
+                    InlineKeyboardButton("Open unified admin panel", web_app=WebAppInfo(url="https://mailpay-et-miniapp-uqfa.onrender.com/admin"))
                 ]]),
             )
         except Exception as e:
