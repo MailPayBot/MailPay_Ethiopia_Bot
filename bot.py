@@ -1031,7 +1031,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "social_links":
         social_text = (
-            "🌐 *Connect with MailPay ET*\\n\\nChoose a platform below:"
+            "🌐 *Connect with MailPay ET*\n\\nChoose a platform below:"
             if lang == "en" else
             "🌐 *ከMailPay ET ጋር ይገናኙ*\\n\\nከታች መድረክ ይምረጡ:"
         )
@@ -2114,7 +2114,8 @@ async def require_channel_membership(update: Update, context: ContextTypes.DEFAU
         await update.effective_message.reply_text(message, reply_markup=keyboard)
     raise ApplicationHandlerStop
 
-app.add_handler(TypeHandler(Update, require_channel_membership), group=-2)\napp.add_handler(TypeHandler(Update, track_user), group=-1)
+    app.add_handler(TypeHandler(Update, require_channel_membership), group=-2)
+    app.add_handler(TypeHandler(Update, track_user), group=-1)
 
     app.add_handler(screenshot_conv)
     app.add_handler(payment_conv)
