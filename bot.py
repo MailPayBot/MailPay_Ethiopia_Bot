@@ -1033,7 +1033,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         social_text = (
             "🌐 *Connect with MailPay ET*\n\nChoose a platform below:"
             if lang == "en" else
-            "🌐 *ከMailPay ET ጋር ይገናኙ*\\n\\nከታች መድረክ ይምረጡ:"
+            "🌐 *ከMailPay ET ጋር ይገናኙ*\n\nከታች መድረክ ይምረጡ:"
         )
         social_keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("🌍 Website", url=WEBSITE_URL)],
