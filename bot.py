@@ -1031,7 +1031,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "social_links":
         social_text = (
-            "🌐 *Connect with MailPay ET*\n\\nChoose a platform below:"
+            "🌐 *Connect with MailPay ET*\n\nChoose a platform below:"
             if lang == "en" else
             "🌐 *ከMailPay ET ጋር ይገናኙ*\\n\\nከታች መድረክ ይምረጡ:"
         )
@@ -1970,6 +1970,60 @@ async def post_init(application: Application):
         print(f"Could not set admin command menu (start the bot from the admin account first): {e}")
 
 
+# --- Required channel membership gate ---
+async def require_channel_membership(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or user.is_bot or user.id == ADMIN_CHAT_ID:
+        return
+
+    query = update.callback_query
+    data = query.data if query else None
+    force_refresh = data == "verify_membership"
+    cache = context.application.bot_data.setdefault("channel_member_cache", {})
+    now = time.time()
+    cached = cache.get(user.id)
+    joined = bool(cached and cached[1] > now)
+    if force_refresh or not joined:
+        try:
+            member = await context.bot.get_chat_member(FORCE_JOIN_CHANNEL, user.id)
+            joined = member.status in ("member", "administrator", "creator") or (
+                member.status == "restricted" and bool(getattr(member, "is_member", False))
+            )
+            cache[user.id] = (joined, now + 60)
+        except Exception as exc:
+            print(f"Channel membership check failed for {user.id}: {exc}")
+            joined = False
+
+    if joined:
+        if force_refresh:
+            await query.answer("Membership verified! Welcome to MailPay ET.", show_alert=True)
+            lang = get_lang(user.id)
+            await query.edit_message_text(TEXTS[lang]["welcome"], reply_markup=main_menu(lang))
+            raise ApplicationHandlerStop
+        return
+
+    lang = get_lang(user.id)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 Join MailPay ET Channel", url=CHANNEL_URL)],
+        [InlineKeyboardButton("✅ I Joined — Verify", callback_data="verify_membership")],
+    ])
+    message = (
+        "Please join our Telegram channel first, then tap Verify Membership."
+        if lang == "en" else
+        "እባክዎ መጀመሪያ የTelegram ቻናላችንን ይቀላቀሉ፣ ከዚያ ማረጋገጫን ይጫኑ።"
+    )
+    if query:
+        if force_refresh:
+            await query.answer("You haven't joined the channel yet.", show_alert=True)
+        else:
+            await query.answer()
+        if query.message:
+            await query.edit_message_text(message, reply_markup=keyboard)
+    elif update.effective_message:
+        await update.effective_message.reply_text(message, reply_markup=keyboard)
+    raise ApplicationHandlerStop
+
+
 # --- Main Entry Point ---
 if __name__ == "__main__":
     threading.Thread(target=run_health_server, daemon=True).start()
@@ -2061,59 +2115,6 @@ if __name__ == "__main__":
 
     # Runs first for every update: remembers who uses the bot
     
-# --- Required channel membership gate ---
-async def require_channel_membership(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user or user.is_bot or user.id == ADMIN_CHAT_ID:
-        return
-
-    query = update.callback_query
-    data = query.data if query else None
-    force_refresh = data == "verify_membership"
-    cache = context.application.bot_data.setdefault("channel_member_cache", {})
-    now = time.time()
-    cached = cache.get(user.id)
-    joined = bool(cached and cached[1] > now)
-    if force_refresh or not joined:
-        try:
-            member = await context.bot.get_chat_member(FORCE_JOIN_CHANNEL, user.id)
-            joined = member.status in ("member", "administrator", "creator") or (
-                member.status == "restricted" and bool(getattr(member, "is_member", False))
-            )
-            cache[user.id] = (joined, now + 60)
-        except Exception as exc:
-            print(f"Channel membership check failed for {user.id}: {exc}")
-            joined = False
-
-    if joined:
-        if force_refresh:
-            await query.answer("Membership verified! Welcome to MailPay ET.", show_alert=True)
-            lang = get_lang(user.id)
-            await query.edit_message_text(TEXTS[lang]["welcome"], reply_markup=main_menu(lang))
-            raise ApplicationHandlerStop
-        return
-
-    lang = get_lang(user.id)
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Join MailPay ET Channel", url=CHANNEL_URL)],
-        [InlineKeyboardButton("✅ I Joined — Verify", callback_data="verify_membership")],
-    ])
-    message = (
-        "Please join our Telegram channel first, then tap Verify Membership."
-        if lang == "en" else
-        "እባክዎ መጀመሪያ የTelegram ቻናላችንን ይቀላቀሉ፣ ከዚያ ማረጋገጫን ይጫኑ።"
-    )
-    if query:
-        if force_refresh:
-            await query.answer("You haven't joined the channel yet.", show_alert=True)
-        else:
-            await query.answer()
-        if query.message:
-            await query.edit_message_text(message, reply_markup=keyboard)
-    elif update.effective_message:
-        await update.effective_message.reply_text(message, reply_markup=keyboard)
-    raise ApplicationHandlerStop
-
     app.add_handler(TypeHandler(Update, require_channel_membership), group=-2)
     app.add_handler(TypeHandler(Update, track_user), group=-1)
 
