@@ -21,6 +21,7 @@ from telegram import (
 from telegram.error import BadRequest, RetryAfter
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -57,6 +58,7 @@ ADMIN_CHAT_ID = 982922116
 SUPPORT_USERNAME = "@CHUNKLA47"
 SUPPORT_URL = "https://t.me/CHUNKLA47"
 CHANNEL_URL = "https://t.me/MailPayEt"
+FORCE_JOIN_CHANNEL = os.getenv("FORCE_JOIN_CHANNEL", "@MailPayEt")
 WEBSITE_URL = "https://mailpayet.github.io/MailPayET/"
 
 # --- User Language Storage ---
@@ -616,10 +618,7 @@ def main_menu(lang="en"):
             InlineKeyboardButton(t["btn_channel"], url=CHANNEL_URL),
             InlineKeyboardButton(t["btn_web"], url=WEBSITE_URL),
         ],
-        [InlineKeyboardButton("ⓕ Facebook", url="https://web.facebook.com/share/p/1MN18PyRa2/")],
-        [InlineKeyboardButton("📸 Instagram", url="https://www.instagram.com/reel/DeFXtuQlZjo/?utm_source=ig_web_copy_link&stkn=MzRlODBiNWFlZA==")],
-        [InlineKeyboardButton("🟢 WhatsApp", url="https://wa.me/message/4AGHRHT64MI4K1")],
-        [InlineKeyboardButton("♪ TikTok", url="https://vm.tiktok.com/ZS9Aveo3qnhSJ-gMcyh/")],
+        [InlineKeyboardButton("🌐 Our Social Media" if lang == "en" else "🌐 ማህበራዊ ሚዲያችን", callback_data="social_links")],
         [InlineKeyboardButton(t["btn_lang"], callback_data="toggle_language")],
         [InlineKeyboardButton(t["btn_support"], callback_data="support")],
     ])
@@ -1029,6 +1028,22 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data in FAQ_ANSWERS[lang]:
         await query.edit_message_text(FAQ_ANSWERS[lang][data], reply_markup=faq_back(lang))
+
+    elif data == "social_links":
+        social_text = (
+            "🌐 *Connect with MailPay ET*\\n\\nChoose a platform below:"
+            if lang == "en" else
+            "🌐 *ከMailPay ET ጋር ይገናኙ*\\n\\nከታች መድረክ ይምረጡ:"
+        )
+        social_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🌍 Website", url=WEBSITE_URL)],
+            [InlineKeyboardButton("ⓕ Facebook", url="https://web.facebook.com/share/p/1MN18PyRa2/")],
+            [InlineKeyboardButton("📸 Instagram", url="https://www.instagram.com/reel/DeFXtuQlZjo/?utm_source=ig_web_copy_link&stkn=MzRlODBiNWFlZA==")],
+            [InlineKeyboardButton("🟢 WhatsApp", url="https://wa.me/message/4AGHRHT64MI4K1")],
+            [InlineKeyboardButton("♪ TikTok", url="https://vm.tiktok.com/ZS9Aveo3qnhSJ-gMcyh/")],
+            [InlineKeyboardButton(TEXTS[lang]["btn_back"], callback_data="main_menu")],
+        ])
+        await query.edit_message_text(social_text, parse_mode="Markdown", reply_markup=social_keyboard)
 
     elif data == "support":
         text, keyboard = support_content(lang)
@@ -2045,7 +2060,61 @@ if __name__ == "__main__":
     )
 
     # Runs first for every update: remembers who uses the bot
-    app.add_handler(TypeHandler(Update, track_user), group=-1)
+    
+# --- Required channel membership gate ---
+async def require_channel_membership(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or user.is_bot or user.id == ADMIN_CHAT_ID:
+        return
+
+    query = update.callback_query
+    data = query.data if query else None
+    force_refresh = data == "verify_membership"
+    cache = context.application.bot_data.setdefault("channel_member_cache", {})
+    now = time.time()
+    cached = cache.get(user.id)
+    joined = bool(cached and cached[1] > now)
+    if force_refresh or not joined:
+        try:
+            member = await context.bot.get_chat_member(FORCE_JOIN_CHANNEL, user.id)
+            joined = member.status in ("member", "administrator", "creator") or (
+                member.status == "restricted" and bool(getattr(member, "is_member", False))
+            )
+            cache[user.id] = (joined, now + 60)
+        except Exception as exc:
+            print(f"Channel membership check failed for {user.id}: {exc}")
+            joined = False
+
+    if joined:
+        if force_refresh:
+            await query.answer("Membership verified! Welcome to MailPay ET.", show_alert=True)
+            lang = get_lang(user.id)
+            await query.edit_message_text(TEXTS[lang]["welcome"], reply_markup=main_menu(lang))
+            raise ApplicationHandlerStop
+        return
+
+    lang = get_lang(user.id)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 Join MailPay ET Channel", url=CHANNEL_URL)],
+        [InlineKeyboardButton("✅ I Joined — Verify", callback_data="verify_membership")],
+    ])
+    message = (
+        "Please join our Telegram channel first, then tap Verify Membership."
+        if lang == "en" else
+        "እባክዎ መጀመሪያ የTelegram ቻናላችንን ይቀላቀሉ፣ ከዚያ ማረጋገጫን ይጫኑ።"
+    )
+    if query:
+        if force_refresh:
+            await query.answer("You haven't joined the channel yet.", show_alert=True)
+        else:
+            await query.answer()
+        if query.message:
+            await query.edit_message_text(message, reply_markup=keyboard)
+    elif update.effective_message:
+        await update.effective_message.reply_text(message, reply_markup=keyboard)
+    raise ApplicationHandlerStop
+
+app.add_handler(TypeHandler(Update, require_channel_membership), group=-2)\napp.add_handler(TypeHandler(Update, track_user), group=-1)
 
     app.add_handler(screenshot_conv)
     app.add_handler(payment_conv)
