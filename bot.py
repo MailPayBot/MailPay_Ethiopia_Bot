@@ -391,6 +391,16 @@ async def track_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if cached and cached[0] == user.username and cached[1] == name and now - cached[2] < 600:
         return
     try:
+        existing_user = await db(
+            "SELECT user_id FROM users WHERE user_id = ? LIMIT 1",
+            (user.id,), "one",
+        )
+        existing_wallet = None
+        if USE_PG and not existing_user:
+            existing_wallet = await db(
+                "SELECT user_id FROM public.mp_wallet_accounts WHERE user_id = ? LIMIT 1",
+                (user.id,), "one",
+            )
         await db(
             "INSERT INTO users (user_id, username, full_name, lang, first_seen, last_seen) "
             "VALUES (?, ?, ?, ?, ?, ?) "
@@ -400,6 +410,25 @@ async def track_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         _SEEN[user.id] = (user.username, name, now)
         if USE_PG:
+            # Attribute a referral before wallet initialization, but only for accounts
+            # that have never existed in the bot or shared wallet before this update.
+            if not existing_user and not existing_wallet and update.effective_message:
+                args = context.args or []
+                if args and str(args[0]).startswith("ref_") and str(args[0])[4:].isdigit():
+                    inviter_id = int(str(args[0])[4:])
+                    if inviter_id != user.id:
+                        try:
+                            await db("""
+                                INSERT INTO public.mp_referrals
+                                    (inviter_id, referred_user_id, referral_code)
+                                SELECT ?, ?, ?
+                                WHERE EXISTS (
+                                    SELECT 1 FROM public.users WHERE user_id = ?
+                                )
+                                ON CONFLICT (referred_user_id) DO NOTHING
+                            """, (inviter_id, user.id, str(args[0]), inviter_id))
+                        except Exception as referral_error:
+                            print(f"Referral attribution failed for {user.id}: {referral_error}")
             try:
                 await ensure_shared_wallet(user.id)
             except Exception as wallet_error:
@@ -923,38 +952,6 @@ async def send_main_menu_after_keyboard_cleanup(message, lang, text=None):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     lang = get_lang(user_id)
-
-    # Capture a referral deep link once, only for a genuinely new MailPay account.
-    if USE_PG and context.args:
-        payload = str(context.args[0]).strip()
-        if payload.startswith("ref_") and payload[4:].isdigit():
-            inviter_id = int(payload[4:])
-            if inviter_id != user_id:
-                try:
-                    await db("""
-                        INSERT INTO public.mp_referrals
-                            (inviter_id, referred_user_id, referral_code)
-                        SELECT %s, %s, %s
-                        WHERE EXISTS (
-                            SELECT 1 FROM public.users WHERE user_id = %s
-                        )
-                        AND NOT EXISTS (
-                            SELECT 1 FROM public.mp_wallet_accounts WHERE user_id = %s
-                        )
-                        AND NOT EXISTS (
-                            SELECT 1 FROM public.mp_tasks WHERE user_id = %s
-                        )
-                        AND NOT EXISTS (
-                            SELECT 1 FROM public.submissions WHERE user_id = %s
-                        )
-                        AND NOT EXISTS (
-                            SELECT 1 FROM public.mp_referrals WHERE referred_user_id = %s
-                        )
-                        ON CONFLICT (referred_user_id) DO NOTHING
-                    """, (inviter_id, user_id, payload, inviter_id,
-                          user_id, user_id, user_id, user_id))
-                except Exception as e:
-                    print(f"Referral attribution failed for {user_id}: {e}")
 
     await send_main_menu_after_keyboard_cleanup(update.message, lang)
 
