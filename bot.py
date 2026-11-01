@@ -427,8 +427,18 @@ async def track_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 WHERE EXISTS (
                                     SELECT 1 FROM public.users WHERE user_id = ?
                                 )
+                                AND NOT EXISTS (
+                                    SELECT 1 FROM public.mp_wallet_accounts WHERE user_id = ?
+                                )
+                                AND NOT EXISTS (
+                                    SELECT 1 FROM public.mp_tasks WHERE user_id = ?
+                                )
+                                AND NOT EXISTS (
+                                    SELECT 1 FROM public.submissions WHERE user_id = ?
+                                )
                                 ON CONFLICT (referred_user_id) DO NOTHING
-                            """, (inviter_id, user.id, payload, inviter_id))
+                            """, (inviter_id, user.id, payload, inviter_id,
+                                  user.id, user.id, user.id))
                         except Exception as referral_error:
                             print(f"Referral attribution failed for {user.id}: {referral_error}")
             try:
