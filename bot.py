@@ -413,9 +413,11 @@ async def track_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Attribute a referral before wallet initialization, but only for accounts
             # that have never existed in the bot or shared wallet before this update.
             if not existing_user and not existing_wallet and update.effective_message:
-                args = context.args or []
-                if args and str(args[0]).startswith("ref_") and str(args[0])[4:].isdigit():
-                    inviter_id = int(str(args[0])[4:])
+                message_text = (update.effective_message.text or "").strip()
+                message_parts = message_text.split()
+                payload = message_parts[1] if len(message_parts) > 1 and message_parts[0].split("@")[0] == "/start" else ""
+                if payload.startswith("ref_") and payload[4:].isdigit():
+                    inviter_id = int(payload[4:])
                     if inviter_id != user.id:
                         try:
                             await db("""
@@ -426,7 +428,7 @@ async def track_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     SELECT 1 FROM public.users WHERE user_id = ?
                                 )
                                 ON CONFLICT (referred_user_id) DO NOTHING
-                            """, (inviter_id, user.id, str(args[0]), inviter_id))
+                            """, (inviter_id, user.id, payload, inviter_id))
                         except Exception as referral_error:
                             print(f"Referral attribution failed for {user.id}: {referral_error}")
             try:
