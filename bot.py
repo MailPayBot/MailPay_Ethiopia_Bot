@@ -204,6 +204,15 @@ def init_db():
         _run("CREATE INDEX IF NOT EXISTS mp_tasks_status_idx ON public.mp_tasks(status, requested_at)")
         _run("CREATE INDEX IF NOT EXISTS mp_ledger_user_idx ON public.mp_wallet_ledger(user_id, available_at)")
         _run("CREATE INDEX IF NOT EXISTS mp_withdrawals_user_idx ON public.mp_withdrawals(user_id, requested_at DESC)")
+        _run("""CREATE TABLE IF NOT EXISTS public.mp_referrals (
+            id BIGSERIAL PRIMARY KEY, inviter_id BIGINT NOT NULL,
+            referred_user_id BIGINT NOT NULL UNIQUE, referral_code TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending'
+              CHECK (status IN ('pending','rewarded','rejected')),
+            approved_task_id BIGINT, reward_amount INTEGER NOT NULL DEFAULT 5 CHECK (reward_amount = 5),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), rewarded_at TIMESTAMPTZ,
+            CHECK (inviter_id <> referred_user_id))""")
+        _run("CREATE INDEX IF NOT EXISTS mp_referrals_inviter_idx ON public.mp_referrals(inviter_id, created_at DESC)")
 
 
 # ---- Shared MailPay ET task and wallet services ----
@@ -914,6 +923,39 @@ async def send_main_menu_after_keyboard_cleanup(message, lang, text=None):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     lang = get_lang(user_id)
+
+    # Capture a referral deep link once, only for a genuinely new MailPay account.
+    if USE_PG and context.args:
+        payload = str(context.args[0]).strip()
+        if payload.startswith("ref_") and payload[4:].isdigit():
+            inviter_id = int(payload[4:])
+            if inviter_id != user_id:
+                try:
+                    await db("""
+                        INSERT INTO public.mp_referrals
+                            (inviter_id, referred_user_id, referral_code)
+                        SELECT %s, %s, %s
+                        WHERE EXISTS (
+                            SELECT 1 FROM public.users WHERE user_id = %s
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM public.mp_wallet_accounts WHERE user_id = %s
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM public.mp_tasks WHERE user_id = %s
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM public.submissions WHERE user_id = %s
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM public.mp_referrals WHERE referred_user_id = %s
+                        )
+                        ON CONFLICT (referred_user_id) DO NOTHING
+                    """, (inviter_id, user_id, payload, inviter_id,
+                          user_id, user_id, user_id, user_id))
+                except Exception as e:
+                    print(f"Referral attribution failed for {user_id}: {e}")
+
     await send_main_menu_after_keyboard_cleanup(update.message, lang)
 
 
