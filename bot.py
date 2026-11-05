@@ -284,7 +284,9 @@ async def list_shared_tasks(user_id, limit=8):
         raise RuntimeError("The shared task system requires the connected MailPay ET database.")
     await db("""UPDATE public.mp_tasks SET status='expired'
                 WHERE user_id=? AND status='assigned' AND expires_at IS NOT NULL AND expires_at<=NOW()""", (user_id,))
-    return await db("""SELECT id,status,instructions,reward_etb,
+    return await db("""SELECT id,status,
+                        CASE WHEN status='assigned' THEN instructions ELSE NULL END AS instructions,
+                        reward_etb,
                         to_char(requested_at AT TIME ZONE 'Africa/Addis_Ababa','YYYY-MM-DD HH24:MI') AS requested_local,
                         to_char(expires_at AT TIME ZONE 'Africa/Addis_Ababa','YYYY-MM-DD HH24:MI') AS expires_local
                      FROM public.mp_tasks WHERE user_id=? ORDER BY requested_at DESC LIMIT ?""", (user_id,limit), "all")
